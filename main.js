@@ -1,24 +1,33 @@
 // ==UserScript==
 // @name         Rain Classroom Courseware Plugin
-// @namespace    https://github.com/c0d805e15c550432/Rainclassroom_Plugin
-// @version      1.2.1
-// @description  雨课堂课件与录播下载、可选随机/AI答题，支持嵌套页面与手机竖屏
-// @author       zhzh
+// @name:zh-CN   雨课堂课程助手
+// @namespace    https://github.com/Librorum/Rainclassroom_Plugin
+// @version      1.3.0
+// @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
+// @description:zh-CN 雨课堂课件与录播下载，可选答题辅助
+// @author       Librorum
 // @match        https://pro.yuketang.cn/*
 // @icon         https://pro.yuketang.cn/favicon.ico
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
 // @grant        GM_info
-// @grant        GM_notification
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_addStyle
 // @grant        unsafeWindow
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js
-// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
-// @connect      *
+// @connect      pro.yuketang.cn
+// @connect      yuketang.cn
+// @connect      *.yuketang.cn
+// @connect      xuetangx.com
+// @connect      *.xuetangx.com
+// @connect      api.siliconflow.cn
+// @connect      dashscope.aliyuncs.com
+// @connect      api.deepseek.com
+// @connect      localhost
+// @connect      127.0.0.1
+// @connect      [::1]
 // @run-at       document-start
 // @license      MIT
 // ==/UserScript==
@@ -32,7 +41,8 @@
     if (PAGE_WINDOW.__rcDownloaderInitialized) return;
     PAGE_WINDOW.__rcDownloaderInitialized = true;
     const IS_TOP_WINDOW = PAGE_WINDOW === PAGE_WINDOW.top;
-    const FRAME_CHANNEL = 'rc-downloader-capture-v1';
+    const FRAME_CHANNEL = 'rc-downloader-channel-v2';
+    const FRAME_SECRET_KEY = 'rc_frame_secret_v2';
 
     // ==================== Configuration Constants ====================
     const CONFIG = {
@@ -56,12 +66,21 @@
         RETRY_BACKOFF_MS: 800,
         VIDEO_TIMEOUT_MS: 600000,  // Video download timeout: 10 minutes
         SAVE_TIMEOUT_MS: 600000,   // Wait for the manager to confirm local saving.
+        MAX_COVER_PAGES: 1000,
+        MAX_IMAGE_BYTES: 20 * 1024 * 1024,
+        MAX_COURSE_BYTES: 512 * 1024 * 1024,
+        MAX_IMAGE_PIXELS: 50_000_000,
+        MAX_VIDEO_BYTES: 4 * 1024 * 1024 * 1024,
+        MAX_API_BYTES: 16 * 1024 * 1024,
+        MAX_AI_RESPONSE_BYTES: 2 * 1024 * 1024,
+        MAX_CHANNEL_BYTES: 20 * 1024 * 1024,
+        ALLOWED_IMAGE_DOMAINS: ['yuketang.cn', 'xuetangx.com'],
     };
 
     // ==================== State Management ====================
     const STATE = {
         processedKeys: new Set(),
-        pendingItems: [],         // { id, name, type:'ppt'|'video', source, headers, checked }
+        pendingItems: [],         // Sources stay in memory; only recovery descriptors are persisted.
         downloadQueue: [],
         isProcessing: false,
         totalCompleted: 0,
@@ -74,15 +93,48 @@
     };
 
     // ==================== Shared resources, tab-local selection ====================
-    const STORAGE_KEY = 'rc_downloader_state';
-    const STORAGE_SOURCE_PREFIX = 'rc_source_';
-    const STORAGE_HEADERS_PREFIX = 'rc_headers_';
+    const STORAGE_KEY = 'rc_downloader_state_v3';
+    const LEGACY_STORAGE_KEY = 'rc_downloader_state';
+    const LEGACY_SOURCE_PREFIX = 'rc_source_';
+    const LEGACY_HEADERS_PREFIX = 'rc_headers_';
     const SELECTION_KEY = 'rc_downloader_selection';
     let selection = {};
     let storageAvailable = true;
     let storageDebounceTimer = null;
     let localMutation = Promise.resolve();
     let sharedLocksAvailable = true;
+    let legacyCredentialCleanupDone = false;
+
+    const hasManagerStorage = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+
+    function sharedStorageGet(key, fallback) {
+        try {
+            if (hasManagerStorage) return GM_getValue(key, fallback);
+            const raw = localStorage.getItem(key);
+            return raw === null ? fallback : JSON.parse(raw);
+        } catch (err) {
+            return fallback;
+        }
+    }
+
+    function sharedStorageSet(key, value) {
+        if (hasManagerStorage) GM_setValue(key, value);
+        else localStorage.setItem(key, JSON.stringify(value));
+    }
+
+    function purgeLegacyCredentialStorage() {
+        if (legacyCredentialCleanupDone) return;
+        legacyCredentialCleanupDone = true;
+        try {
+            const remove = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && (key.startsWith(LEGACY_SOURCE_PREFIX) || key.startsWith(LEGACY_HEADERS_PREFIX))) remove.push(key);
+            }
+            remove.forEach(key => localStorage.removeItem(key));
+            localStorage.removeItem(LEGACY_STORAGE_KEY);
+        } catch (err) {}
+    }
 
     function saveSelection() {
         selection = Object.fromEntries(STATE.pendingItems.map(it => [it.id, it.checked]));
@@ -92,31 +144,15 @@
     function saveState() {
         if (!IS_TOP_WINDOW || !storageAvailable) return;
         try {
-            const previous = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-            // Publish the index last so other tabs never see half-written items.
-            for (const it of STATE.pendingItems) {
-                const source = JSON.stringify(it.source);
-                const headers = JSON.stringify(it.headers || {});
-                if (localStorage.getItem(STORAGE_SOURCE_PREFIX + it.id) !== source) {
-                    localStorage.setItem(STORAGE_SOURCE_PREFIX + it.id, source);
-                }
-                if (localStorage.getItem(STORAGE_HEADERS_PREFIX + it.id) !== headers) {
-                    localStorage.setItem(STORAGE_HEADERS_PREFIX + it.id, headers);
-                }
-            }
-            localStorage.setItem(STORAGE_KEY, JSON.stringify({
-                processedKeys: [...STATE.processedKeys],
-                pendingMeta: STATE.pendingItems.map(({ id, name, type, captureKey }) => ({ id, name, type, captureKey })),
+            sharedStorageSet(STORAGE_KEY, {
+                version: 3,
+                processedKeys: [...STATE.processedKeys].map(sanitizeProcessedKey).filter(Boolean).slice(-5000),
+                pendingMeta: STATE.pendingItems.map(({ id, name, type, captureKey, recovery }) => ({
+                    id, name, type, captureKey: sanitizeProcessedKey(captureKey), recovery: validRecovery(recovery),
+                })),
                 totalCompleted: STATE.totalCompleted,
-                completionVersion: 2,
-            }));
-            const remaining = new Set(STATE.pendingItems.map(it => String(it.id)));
-            for (const it of previous.pendingMeta || []) {
-                if (!remaining.has(String(it.id))) {
-                    localStorage.removeItem(STORAGE_SOURCE_PREFIX + it.id);
-                    localStorage.removeItem(STORAGE_HEADERS_PREFIX + it.id);
-                }
-            }
+                completionVersion: 3,
+            });
         } catch (e) {
             storageAvailable = false;
             uiLog('存储不可用或已满，变更仅保留在当前标签页。', 'warn');
@@ -126,21 +162,34 @@
     function loadState() {
         if (!storageAvailable) return false;
         try {
-            const meta = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+            const liveSources = new Map(STATE.pendingItems.map(item => [String(item.id), item.source]));
+            let meta = sharedStorageGet(STORAGE_KEY, null);
+            if (!meta || typeof meta !== 'object') {
+                meta = migrateLegacyState();
+                for (const item of STATE.pendingItems) liveSources.set(String(item.id), item.source);
+                if (meta) {
+                    try { sharedStorageSet(STORAGE_KEY, meta); }
+                    catch (err) {
+                        storageAvailable = false;
+                        uiLog('旧状态已迁入当前页面，但共享存储不可用；刷新前请完成下载。', 'warn');
+                    }
+                }
+                purgeLegacyCredentialStorage();
+            }
             const pending = [];
-            for (const m of meta.pendingMeta || []) {
+            for (const m of (meta?.pendingMeta || []).slice(0, 2000)) {
                 try {
-                    const source = JSON.parse(localStorage.getItem(STORAGE_SOURCE_PREFIX + m.id) || 'null');
-                    if (source === null) continue;
                     const id = String(m.id); // Also migrates IDs from version 1.0.
-                    const headers = JSON.parse(localStorage.getItem(STORAGE_HEADERS_PREFIX + m.id) || '{}');
-                    pending.push({ id, name: chineseName(m.name), type: m.type || 'ppt', captureKey: m.captureKey, source, headers,
+                    pending.push({ id, name: chineseName(m.name), type: m.type === 'video' ? 'video' : 'ppt',
+                        captureKey: typeof m.captureKey === 'string' ? m.captureKey : '',
+                        recovery: validRecovery(m.recovery), source: liveSources.get(id) || null, headers: {},
                         checked: Object.hasOwn(selection, id) ? selection[id] : m.checked !== false });
                 } catch (e) { /* Skip only the corrupt item. */ }
             }
-            STATE.processedKeys = new Set(meta.processedKeys || []);
+            STATE.processedKeys = new Set((Array.isArray(meta?.processedKeys) ? meta.processedKeys : [])
+                .map(sanitizeProcessedKey).filter(Boolean).slice(-5000));
             // Older versions counted a.click(), not confirmed saves.
-            STATE.totalCompleted = meta.completionVersion === 2 ? (meta.totalCompleted || 0) : 0;
+            STATE.totalCompleted = [2, 3].includes(meta?.completionVersion) ? Math.max(0, Number(meta.totalCompleted) || 0) : 0;
             STATE.pendingItems = pending;
             saveSelection();
             return true;
@@ -148,6 +197,102 @@
             storageAvailable = false;
             return false;
         }
+    }
+
+    function validRecovery(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const kind = value.kind;
+        if (kind === 'ppt') {
+            return {
+                kind,
+                lessonId: typeof value.lessonId === 'string' ? value.lessonId.slice(0, 200) : '',
+                presentationId: typeof value.presentationId === 'string' ? value.presentationId.slice(0, 200) : '',
+                apiUrl: typeof value.apiUrl === 'string' ? value.apiUrl.slice(0, 2000) : '',
+            };
+        }
+        if (kind === 'video') {
+            return {
+                kind,
+                host: typeof value.host === 'string' ? value.host.slice(0, 200) : '',
+                presentationId: typeof value.presentationId === 'string' ? value.presentationId.slice(0, 200) : '',
+                pathHash: typeof value.pathHash === 'string' ? value.pathHash.slice(0, 64) : '',
+            };
+        }
+        return null;
+    }
+
+    function sanitizeProcessedKey(value) {
+        if (typeof value !== 'string' || !value || value.length > 2000) return '';
+        if (value.startsWith('video:')) {
+            const stable = value.slice(6);
+            if (/^[a-z0-9.-]+:[0-9a-f]{8}$/i.test(stable)) return value;
+            try {
+                const url = new URL(stable);
+                return ('video:' + url.hostname + ':' + shortFingerprint(url.pathname)).slice(0, 500);
+            } catch (err) { return ''; }
+        }
+        if (value.startsWith('ppt:')) {
+            const safe = safeApiRecoveryUrl(value.slice(4));
+            return safe ? 'ppt:' + safe : value.slice(0, 500);
+        }
+        return value.slice(0, 500);
+    }
+
+    function recoveryFromCaptureKey(type, key) {
+        if (typeof key !== 'string') return null;
+        if (type === 'video' && key.startsWith('video:')) {
+            try {
+                const url = new URL(key.slice(6));
+                return { kind: 'video', host: url.hostname, presentationId: extractPresentationIdFromVideoUrl(url.href) || '',
+                    pathHash: shortFingerprint(url.pathname) };
+            } catch (err) { return null; }
+        }
+        if (type === 'ppt') {
+            const lesson = /^lesson:([\w-]{1,200}):([\w-]{1,200})$/.exec(key);
+            if (lesson) return { kind: 'ppt', lessonId: lesson[1], presentationId: lesson[2] };
+            if (key.startsWith('ppt:')) return { kind: 'ppt', apiUrl: safeApiRecoveryUrl(key.slice(4)) };
+        }
+        return null;
+    }
+
+    function shortFingerprint(value) {
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < value.length; i++) {
+            hash ^= value.charCodeAt(i);
+            hash = Math.imul(hash, 0x01000193);
+        }
+        return (hash >>> 0).toString(16).padStart(8, '0');
+    }
+
+    function migrateLegacyState() {
+        try {
+            const old = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) || 'null');
+            if (!old || typeof old !== 'object') return null;
+            const pendingMeta = [];
+            for (const item of (Array.isArray(old.pendingMeta) ? old.pendingMeta : []).slice(0, 2000)) {
+                try {
+                    const id = String(item.id);
+                    const source = JSON.parse(localStorage.getItem(LEGACY_SOURCE_PREFIX + item.id) || 'null');
+                    if (source === null) continue;
+                    pendingMeta.push({ id, name: chineseName(item.name), type: item.type === 'video' ? 'video' : 'ppt',
+                        captureKey: sanitizeProcessedKey(item.captureKey),
+                        recovery: recoveryFromCaptureKey(item.type === 'video' ? 'video' : 'ppt', item.captureKey),
+                        checked: item.checked !== false });
+                    STATE.pendingItems.push({ id, name: chineseName(item.name), type: item.type === 'video' ? 'video' : 'ppt',
+                        captureKey: sanitizeProcessedKey(item.captureKey),
+                        recovery: recoveryFromCaptureKey(item.type === 'video' ? 'video' : 'ppt', item.captureKey),
+                        source, headers: {}, checked: item.checked !== false });
+                } catch (err) {}
+            }
+            return {
+                version: 3,
+                processedKeys: (Array.isArray(old.processedKeys) ? old.processedKeys : [])
+                    .map(sanitizeProcessedKey).filter(Boolean).slice(-5000),
+                pendingMeta,
+                totalCompleted: old.completionVersion === 2 ? (Number(old.totalCompleted) || 0) : 0,
+                completionVersion: 3,
+            };
+        } catch (err) { return null; }
     }
 
     // Serialize read/modify/write across tabs; selection never writes shared state.
@@ -195,28 +340,168 @@
             clearTimeout(storageDebounceTimer);
             storageDebounceTimer = setTimeout(reloadStateAndUI, 50);
         });
+        if (typeof GM_addValueChangeListener === 'function') {
+            GM_addValueChangeListener(STORAGE_KEY, (_key, _oldValue, _newValue, remote) => {
+                if (!remote) return;
+                clearTimeout(storageDebounceTimer);
+                storageDebounceTimer = setTimeout(reloadStateAndUI, 50);
+            });
+        }
     }
 
-    // A shared same-origin DOM document works across userscript sandboxes, where
-    // postMessage.source can be null or differ from the sandbox's window wrapper.
-    // Access to this document is enforced by the browser's same-origin policy;
-    // frames in an unrelated top-level site cannot dispatch captures into it.
-    function coordinatorDocument() {
-        try { return PAGE_WINDOW.top.document; } catch (err) { return null; }
+    // Same-origin page messages are authenticated with a random secret kept in
+    // the userscript manager. The page can observe messages, but cannot forge
+    // command semantics or replay one-time commands.
+    let frameKeyPromise = null;
+    let lastFrameKeyReload = 0;
+    const seenChannelCommands = new Map();
+    const seenCaptureIds = new Map();
+    const channelHandlers = new Map();
+    let channelListenerInstalled = false;
+
+    function base64Url(bytes) {
+        let binary = '';
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
     }
 
-    function emitFrameEvent(type, data) {
-        const target = coordinatorDocument();
-        if (!target) return;
-        const event = target.createEvent('CustomEvent');
-        // A string detail also avoids Firefox's cross-compartment object access.
-        event.initCustomEvent(type, false, false, JSON.stringify(data));
-        target.dispatchEvent(event);
+    async function getFrameAuthKey(reload = false) {
+        if (reload) frameKeyPromise = null;
+        if (frameKeyPromise) return frameKeyPromise;
+        frameKeyPromise = (async () => {
+            if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function'
+                || typeof crypto === 'undefined' || !crypto.subtle) return null;
+            let secret = GM_getValue(FRAME_SECRET_KEY, '');
+            if (!/^[A-Za-z0-9_-]{43}$/.test(secret || '')) {
+                secret = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+                GM_setValue(FRAME_SECRET_KEY, secret);
+                // If the top frame and an iframe initialized together, use the
+                // value that actually won the shared-storage race.
+                secret = GM_getValue(FRAME_SECRET_KEY, secret);
+            }
+            const material = new TextEncoder().encode(secret);
+            return crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+        })().catch(() => null);
+        return frameKeyPromise;
     }
 
-    function parseFrameEvent(event) {
-        try { return typeof event.detail === 'string' ? JSON.parse(event.detail) : null; }
-        catch (err) { return null; }
+    async function createChannelEnvelope(type, payload, targetFrameId = null, reloadKey = false) {
+        const key = await getFrameAuthKey(reloadKey);
+        if (!key) throw new Error('安全帧通道不可用');
+        const body = JSON.stringify({
+            version: 2,
+            channel: FRAME_CHANNEL,
+            id: createItemId(),
+            type,
+            fromFrame: frameId,
+            targetFrame: targetFrameId,
+            timestamp: Date.now(),
+            payload,
+        });
+        if (body.length > CONFIG.MAX_CHANNEL_BYTES) throw new Error('帧消息过大');
+        const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body));
+        return JSON.stringify({ version: 2, body, signature: base64Url(new Uint8Array(signature)) });
+    }
+
+    async function verifyChannelEnvelope(raw) {
+        try {
+            const envelope = typeof raw === 'string' ? JSON.parse(raw) : null;
+            if (!envelope || envelope.version !== 2 || typeof envelope.body !== 'string'
+                || typeof envelope.signature !== 'string' || envelope.body.length > CONFIG.MAX_CHANNEL_BYTES) return null;
+            const key = await getFrameAuthKey();
+            if (!key) return null;
+            const normalized = envelope.signature.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((envelope.signature.length + 3) % 4);
+            const binary = atob(normalized);
+            const signature = Uint8Array.from(binary, char => char.charCodeAt(0));
+            const valid = await crypto.subtle.verify('HMAC', key, signature, new TextEncoder().encode(envelope.body));
+            if (!valid) {
+                if (Date.now() - lastFrameKeyReload > 5000) {
+                    lastFrameKeyReload = Date.now();
+                    await getFrameAuthKey(true);
+                }
+                return null;
+            }
+            const body = JSON.parse(envelope.body);
+            if (!body || body.version !== 2 || body.channel !== FRAME_CHANNEL || typeof body.id !== 'string' || body.id.length > 100
+                || typeof body.type !== 'string' || typeof body.fromFrame !== 'string'
+                || !Number.isFinite(body.timestamp) || Math.abs(Date.now() - body.timestamp) > 120000) return null;
+            return body;
+        } catch (err) { return null; }
+    }
+
+    function listenChannel(types, handler) {
+        for (const type of types) {
+            const handlers = channelHandlers.get(type) || [];
+            handlers.push(handler);
+            channelHandlers.set(type, handlers);
+        }
+        if (channelListenerInstalled || typeof PAGE_WINDOW.addEventListener !== 'function') return;
+        channelListenerInstalled = true;
+        PAGE_WINDOW.addEventListener('message', async event => {
+            if (event.origin !== location.origin) return;
+            const body = await verifyChannelEnvelope(event.data);
+            if (!body) return;
+            for (const handler of channelHandlers.get(body.type) || []) {
+                try { await handler(body); } catch (err) { console.warn('[Rainclassroom] Frame message failed:', err); }
+            }
+        });
+    }
+
+    function consumeChannelCommand(id) {
+        const now = Date.now();
+        for (const [key, timestamp] of seenChannelCommands) {
+            if (now - timestamp > 120000) seenChannelCommands.delete(key);
+        }
+        if (!id || seenChannelCommands.has(id)) return false;
+        seenChannelCommands.set(id, now);
+        if (seenChannelCommands.size > 500) seenChannelCommands.delete(seenChannelCommands.keys().next().value);
+        return true;
+    }
+
+    function hasSeenCapture(id) {
+        const now = Date.now();
+        for (const [key, timestamp] of seenCaptureIds) if (now - timestamp > 120000) seenCaptureIds.delete(key);
+        if (!id || seenCaptureIds.has(id)) return true;
+        seenCaptureIds.set(id, now);
+        if (seenCaptureIds.size > 1000) seenCaptureIds.delete(seenCaptureIds.keys().next().value);
+        return false;
+    }
+
+    function postEnvelopeToTop(envelope) {
+        try { PAGE_WINDOW.top.postMessage(envelope, location.origin); }
+        catch (err) {}
+    }
+
+    function postEnvelopeToFrames(envelope) {
+        const visited = new Set();
+        const deliver = root => {
+            if (visited.has(root)) return;
+            visited.add(root);
+            let length = 0;
+            try { length = root.frames.length; } catch (err) { return; }
+            for (let i = 0; i < length; i++) {
+                let child;
+                try { child = root.frames[i]; } catch (err) { continue; }
+                if (!child || visited.has(child)) continue;
+                try { child.postMessage(envelope, location.origin); } catch (err) {}
+                deliver(child);
+            }
+        };
+        try {
+            deliver(PAGE_WINDOW);
+        } catch (err) {}
+    }
+
+    async function sendToTop(type, payload, reloadKey = false, targetFrameId = null) {
+        const envelope = await createChannelEnvelope(type, payload, targetFrameId, reloadKey);
+        postEnvelopeToTop(envelope);
+        return envelope;
+    }
+
+    async function sendToFrames(type, payload, targetFrameId = null) {
+        const envelope = await createChannelEnvelope(type, payload, targetFrameId);
+        postEnvelopeToFrames(envelope);
+        return envelope;
     }
 
     const frameOutbox = new Map();
@@ -228,33 +513,33 @@
         frameOutbox.set(captureId, { data, created: Date.now() });
         // Bound memory if the top-level site does not run this userscript.
         if (frameOutbox.size > 100) frameOutbox.delete(frameOutbox.keys().next().value);
-        emitFrameEvent(FRAME_CHANNEL, data);
+        sendToTop('capture', data).catch(err => uiLog('安全帧通道不可用：' + err.message, 'error'));
     }
 
     function setupFrameRelay() {
-        const target = coordinatorDocument();
-        if (!target) return;
-        target.addEventListener(FRAME_CHANNEL + ':ack', event => {
-            const data = parseFrameEvent(event);
-            if (data) frameOutbox.delete(data.captureId);
+        listenChannel(['capture-ack'], body => {
+            if (body.targetFrame !== frameId) return;
+            if (body.payload?.captureId) frameOutbox.delete(body.payload.captureId);
         });
-        // @require can make the top frame start later than a child. Retain early
-        // captures until acknowledged rather than losing them during initialization.
         setInterval(() => {
             for (const [id, entry] of frameOutbox) {
                 if (Date.now() - entry.created > 30000) frameOutbox.delete(id);
-                else emitFrameEvent(FRAME_CHANNEL, entry.data);
+                else sendToTop('capture', entry.data, true).catch(() => {});
             }
         }, 1000);
     }
 
     function setupFrameListener() {
-        document.addEventListener(FRAME_CHANNEL, event => {
-            const data = parseFrameEvent(event);
-            if (!data) return;
+        if (!IS_TOP_WINDOW) return;
+        listenChannel(['capture'], body => {
+            const data = body.payload;
+            if (!data || typeof data !== 'object') return;
+            const acknowledge = () => sendToFrames('capture-ack', { captureId: data.captureId }, body.fromFrame).catch(() => {});
+            if (hasSeenCapture(data.captureId)) { acknowledge(); return; }
             if (data.kind === 'quiz') {
+                if (data.frameId !== body.fromFrame) return;
                 receiveQuizEvent(data.event, data.frameId);
-                if (data.captureId) emitFrameEvent(FRAME_CHANNEL + ':ack', { captureId: data.captureId });
+                acknowledge();
                 return;
             }
             if (!['api', 'video', 'courseware-status'].includes(data.kind)) return;
@@ -265,7 +550,7 @@
             if (data.kind === 'courseware-status' && typeof data.message === 'string') {
                 setCoursewareStatus(data.message.slice(0, 300), ['warn', 'error'].includes(data.level) ? data.level : 'info');
             }
-            if (data.captureId) emitFrameEvent(FRAME_CHANNEL + ':ack', { captureId: data.captureId });
+            acknowledge();
         });
     }
 
@@ -281,42 +566,38 @@
 
     function sanitizeFilename(name) {
         if (typeof name !== 'string') name = String(name || 'untitled');
-        name = name.replace(/[\\/:*?"<>|\r\n\t]+/g, '_').trim();
-        return name.slice(0, 180) || 'untitled';
-    }
-
-    function getCookieHeader() {
-        return document.cookie;
+        name = name.normalize('NFKC')
+            .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '_')
+            .replace(/[\\/:*?"<>|]+/g, '_')
+            .trim()
+            .replace(/[. ]+$/g, '');
+        if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = '_' + name;
+        return name.slice(0, 180).replace(/[. ]+$/g, '') || 'untitled';
     }
 
     function buildApiHeaders() {
         return {
             'accept': 'application/json, text/plain, */*',
-            'referer': CONFIG.INDEX_URL,
-            'cookie': getCookieHeader(),
-            'user-agent': navigator.userAgent,
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-ch-ua': '"Chromium";v="145", "Not:A-Brand";v="99"',
-            'dnt': '1',
-            'sec-ch-ua-mobile': '?0',
-            'sec-fetch-site': 'same-site',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-dest': 'empty',
             'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
         };
     }
 
+    function appendParams(url, params) {
+        if (!params) return url;
+        const fullUrl = new URL(url, location.href);
+        for (const [key, value] of Object.entries(params)) fullUrl.searchParams.set(key, String(value));
+        return fullUrl.href;
+    }
+
     function gmRequestJSON(url, headers, params) {
         return new Promise((resolve, reject) => {
-            let fullUrl = url;
-            if (params) {
-                const searchParams = new URLSearchParams(params);
-                fullUrl = url + (url.includes('?') ? '&' : '?') + searchParams.toString();
-            }
+            const fullUrl = appendParams(url, params);
+            if (!apiEndpoint(fullUrl)) { reject(new Error('接口地址不在允许范围内')); return; }
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: fullUrl,
-                headers: headers,
+                headers: headers || buildApiHeaders(),
+                anonymous: false,
                 timeout: 30000,
                 onload: function (resp) {
                     if (resp.status < 200 || resp.status >= 300) {
@@ -324,6 +605,9 @@
                         return;
                     }
                     try {
+                        const finalUrl = resp.finalUrl || resp.responseURL || fullUrl;
+                        if (!apiEndpoint(finalUrl)) throw new Error('接口重定向到未授权地址');
+                        if (String(resp.responseText || '').length > CONFIG.MAX_API_BYTES) throw new Error('接口响应过大');
                         resolve(JSON.parse(resp.responseText));
                     } catch (e) {
                         reject(new Error('接口数据解析失败：' + e.message));
@@ -337,6 +621,23 @@
                 },
             });
         });
+    }
+
+    async function pageRequestJSON(url, headers, params) {
+        const fullUrl = appendParams(url, params);
+        if (!apiEndpoint(fullUrl)) throw new Error('接口地址不在允许范围内');
+        if (typeof PAGE_WINDOW.fetch !== 'function') return gmRequestJSON(fullUrl, headers);
+        const response = await PAGE_WINDOW.fetch(fullUrl, {
+            method: 'GET', credentials: 'include', headers: headers || buildApiHeaders(),
+        });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        if (response.url && !apiEndpoint(response.url)) throw new Error('接口重定向到未授权地址');
+        try {
+            const text = await response.text();
+            if (text.length > CONFIG.MAX_API_BYTES) throw new Error('接口响应过大');
+            return JSON.parse(text);
+        }
+        catch (err) { throw new Error('接口数据解析失败：' + err.message); }
     }
 
     let activeRequests = 0;
@@ -368,7 +669,7 @@
         }
     }
 
-    function requestBlob(url, headers, { timeout = 30000, onProgress, group, requirePartial = false } = {}) {
+    function requestBlob(url, headers, { timeout = 30000, onProgress, group, requirePartial = false, anonymous = false, maxBytes = 0 } = {}) {
         return withDownloadSlot(() => new Promise((resolve, reject) => {
             if (group?.cancelled) { reject(new Error('下载已取消')); return; }
             let handle;
@@ -386,7 +687,7 @@
             group?.requests.add(cancel);
             try {
                 handle = GM_xmlhttpRequest({
-                    method: 'GET', url, headers, responseType: 'blob', timeout,
+                    method: 'GET', url, headers, responseType: 'blob', timeout, anonymous,
                     onload: resp => {
                         if (resp.status >= 200 && resp.status < 300) finish(resolve, resp);
                         else finish(reject, Object.assign(new Error('HTTP ' + resp.status), { status: resp.status }));
@@ -402,16 +703,114 @@
                             handle?.abort();
                         }
                     },
-                    onprogress: resp => { if (!settled && onProgress) onProgress(resp); },
+                    onprogress: resp => {
+                        if (settled) return;
+                        if (maxBytes > 0 && resp.loaded > maxBytes) {
+                            finish(reject, Object.assign(new Error('资源超过大小上限'), { status: 413 }));
+                            handle?.abort();
+                            return;
+                        }
+                        if (onProgress) onProgress(resp);
+                    },
                 });
             } catch (err) { finish(reject, err); }
         }));
     }
 
+    function hostMatches(hostname, domain) {
+        return hostname === domain || hostname.endsWith('.' + domain);
+    }
+
+    function isAllowedImageUrl(value) {
+        if (typeof value !== 'string' || value.length > 8192) return false;
+        try {
+            const url = new URL(value, location.href);
+            return url.protocol === 'https:' && !url.username && !url.password
+                && CONFIG.ALLOWED_IMAGE_DOMAINS.some(domain => hostMatches(url.hostname, domain));
+        } catch (err) { return false; }
+    }
+
+    function validateFinalMediaUrl(response, validator) {
+        const finalUrl = response?.finalUrl || response?.responseURL;
+        if (finalUrl && !validator(finalUrl)) throw new Error('资源重定向到未授权地址');
+    }
+
+    async function detectImageType(blob) {
+        const bytes = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+        if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+        if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+            && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return 'image/png';
+        if (bytes.length >= 6 && /^GIF8[79]a$/.test(String.fromCharCode(...bytes.slice(0, 6)))) return 'image/gif';
+        if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF'
+            && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp';
+        return '';
+    }
+
+    function uint16BE(bytes, offset) { return bytes[offset] * 256 + bytes[offset + 1]; }
+    function uint16LE(bytes, offset) { return bytes[offset] + bytes[offset + 1] * 256; }
+    function uint32BE(bytes, offset) {
+        return ((bytes[offset] * 0x1000000) + (bytes[offset + 1] << 16) + (bytes[offset + 2] << 8) + bytes[offset + 3]) >>> 0;
+    }
+
+    async function readImageDimensions(blob, type) {
+        const bytes = new Uint8Array(await blob.slice(0, Math.min(blob.size, 256 * 1024)).arrayBuffer());
+        if (type === 'image/png' && bytes.length >= 24) return [uint32BE(bytes, 16), uint32BE(bytes, 20)];
+        if (type === 'image/gif' && bytes.length >= 10) return [uint16LE(bytes, 6), uint16LE(bytes, 8)];
+        if (type === 'image/jpeg') {
+            let offset = 2;
+            while (offset + 4 <= bytes.length) {
+                if (bytes[offset] !== 0xff) { offset++; continue; }
+                while (bytes[offset] === 0xff) offset++;
+                const marker = bytes[offset++];
+                if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+                if (marker === 0xda || offset + 2 > bytes.length) break;
+                const length = uint16BE(bytes, offset);
+                if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)
+                    && length >= 7 && offset + 7 <= bytes.length) return [uint16BE(bytes, offset + 5), uint16BE(bytes, offset + 3)];
+                if (length < 2) break;
+                offset += length;
+            }
+        }
+        if (type === 'image/webp' && bytes.length >= 30) {
+            const chunk = String.fromCharCode(...bytes.slice(12, 16));
+            if (chunk === 'VP8X') {
+                return [1 + bytes[24] + bytes[25] * 256 + bytes[26] * 65536,
+                    1 + bytes[27] + bytes[28] * 256 + bytes[29] * 65536];
+            }
+            if (chunk === 'VP8L' && bytes[20] === 0x2f) {
+                const width = 1 + (bytes[21] + (bytes[22] << 8 & 0x3fff));
+                const height = 1 + ((bytes[22] >> 6) + (bytes[23] << 2) + ((bytes[24] & 0x0f) << 10));
+                return [width, height];
+            }
+            if (chunk === 'VP8 ' && bytes.length >= 30 && bytes[23] === 0x9d && bytes[24] === 0x01 && bytes[25] === 0x2a) {
+                return [uint16LE(bytes, 26) & 0x3fff, uint16LE(bytes, 28) & 0x3fff];
+            }
+        }
+        return [0, 0];
+    }
+
+    async function validateImageResponse(response, requestedUrl) {
+        validateFinalMediaUrl(response, isAllowedImageUrl);
+        const blob = response.response;
+        if (!(blob instanceof Blob) || !blob.size) throw new Error('图片内容为空');
+        const declaredLength = Number(responseHeader(response, 'content-length'));
+        if ((declaredLength > 0 && blob.size !== declaredLength) || blob.size > CONFIG.MAX_IMAGE_BYTES) {
+            throw new Error('图片大小异常');
+        }
+        const type = await detectImageType(blob);
+        if (!type) throw new Error('图片格式不受支持');
+        const [width, height] = await readImageDimensions(blob, type);
+        if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0
+            || width * height > CONFIG.MAX_IMAGE_PIXELS) throw new Error('图片尺寸异常');
+        return new Blob([blob], { type });
+    }
+
     async function gmDownloadImage(url, headers) {
-        const resp = await withRetry(() => requestBlob(url, headers));
-        if (!resp.response?.size) throw new Error('图片内容为空');
-        return resp.response;
+        if (!isAllowedImageUrl(url)) throw new Error('图片地址不在允许范围内');
+        const resp = await withRetry(() => requestBlob(url,
+            { Accept: 'image/jpeg,image/png,image/webp,image/gif' },
+            { anonymous: true, maxBytes: CONFIG.MAX_IMAGE_BYTES }));
+        return validateImageResponse(resp, url);
     }
 
     // Pull work as each worker becomes free; a slow request cannot block a lane.
@@ -455,6 +854,7 @@
         }
 
         if (!Array.isArray(timeline)) return [];
+        if (timeline.length > CONFIG.MAX_COVER_PAGES) throw new Error('课件页数超出安全上限');
 
         const items = [];
         timeline.forEach((entry, pos) => {
@@ -467,7 +867,7 @@
                 pageIndex = pos + 1;
             }
             if (typeof pageIndex === 'string' && /^\d+$/.test(pageIndex)) pageIndex = parseInt(pageIndex, 10);
-            if (typeof cover === 'string' && cover.trim() && typeof pageIndex === 'number') items.push([pageIndex, cover]);
+            if (typeof cover === 'string' && cover.trim() && Number.isSafeInteger(pageIndex) && pageIndex > 0) items.push([pageIndex, cover]);
         });
 
         const seen = new Set();
@@ -483,20 +883,100 @@
 
     // ==================== PDF Generation ====================
     async function imagesToPdf(imageBlobs) {
-        const { jsPDF } = window.jspdf;
         if (!imageBlobs || imageBlobs.length === 0) throw new Error('没有可用图片');
 
-        const pdf = new jsPDF({ orientation: 'landscape', unit: 'px', format: [960, 540] });
+        const canvas = typeof document.createElement === 'function' ? document.createElement('canvas') : null;
+        if (!canvas) throw new Error('当前环境无法生成 PDF');
+        return buildPdfPages(imageBlobs, canvas);
+    }
 
-        for (let i = 0; i < imageBlobs.length; i++) {
-            if (i > 0) pdf.addPage([960, 540]);
-            const dataUrl = await blobToDataUrl(imageBlobs[i]);
+    async function buildPdfPages(imageBlobs, canvas) {
+        canvas.width = 960;
+        canvas.height = 540;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('无法创建 PDF 画布');
+        const pages = [];
+        for (const blob of imageBlobs) {
+            const dataUrl = await blobToDataUrl(blob);
             const img = await loadImage(dataUrl);
-            const ratio = Math.min(960 / img.width, 540 / img.height);
-            const w = img.width * ratio, h = img.height * ratio;
-            pdf.addImage(dataUrl, 'JPEG', (960 - w) / 2, (540 - h) / 2, w, h);
+            const width = Number(img.naturalWidth || img.width);
+            const height = Number(img.naturalHeight || img.height);
+            if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0
+                || width * height > CONFIG.MAX_IMAGE_PIXELS) throw new Error('图片尺寸异常');
+            const ratio = Math.min(960 / width, 540 / height);
+            const drawWidth = width * ratio;
+            const drawHeight = height * ratio;
+            context.fillStyle = '#fff';
+            context.fillRect(0, 0, 960, 540);
+            context.imageSmoothingEnabled = true;
+            context.imageSmoothingQuality = 'high';
+            context.drawImage(img, (960 - drawWidth) / 2, (540 - drawHeight) / 2, drawWidth, drawHeight);
+            pages.push(await canvasJpegBytes(canvas));
         }
-        return pdf.output('blob');
+        return buildPdfDocument(pages);
+    }
+
+    async function canvasJpegBytes(canvas) {
+        if (typeof canvas.toBlob === 'function') {
+            const jpeg = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+            if (jpeg instanceof Blob && jpeg.size) return new Uint8Array(await jpeg.arrayBuffer());
+        }
+        if (typeof canvas.toDataURL === 'function') {
+            const encoded = canvas.toDataURL('image/jpeg', 0.92).split(',')[1];
+            if (encoded) return Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+        }
+        throw new Error('PDF 页面编码失败');
+    }
+
+    function buildPdfDocument(jpegPages) {
+        const encoder = new TextEncoder();
+        const objects = [];
+        const pageIds = [];
+        objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+        for (let i = 0; i < jpegPages.length; i++) {
+            const pageId = 3 + i * 3;
+            const imageId = pageId + 1;
+            const contentId = pageId + 2;
+            pageIds.push(`${pageId} 0 R`);
+            objects[pageId] = { page: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 960 540] /Resources << /XObject << /Im0 ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>` };
+            objects[imageId] = { jpeg: jpegPages[i] };
+            objects[contentId] = { content: 'q\n960 0 0 540 0 0 cm\n/Im0 Do\nQ\n' };
+        }
+        objects[2] = `<< /Type /Pages /Kids [${pageIds.join(' ')}] /Count ${jpegPages.length} >>`;
+
+        const parts = [];
+        let byteLength = 0;
+        const append = part => {
+            const bytes = typeof part === 'string' ? encoder.encode(part) : part;
+            parts.push(bytes);
+            byteLength += bytes.length;
+        };
+        append('%PDF-1.4\n');
+        append(new Uint8Array([0x25, 0xe2, 0xe3, 0xcf, 0xd3, 0x0a]));
+        const offsets = new Array(objects.length).fill(0);
+        for (let id = 1; id < objects.length; id++) {
+            offsets[id] = byteLength;
+            append(`${id} 0 obj\n`);
+            const object = objects[id];
+            if (object && object.jpeg) {
+                append(`<< /Type /XObject /Subtype /Image /Width 960 /Height 540 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${object.jpeg.length} >>\nstream\n`);
+                append(object.jpeg);
+                append('\nendstream\n');
+            } else if (object && object.content) {
+                const content = encoder.encode(object.content);
+                append(`<< /Length ${content.length} >>\nstream\n`);
+                append(content);
+                append('endstream\n');
+            } else {
+                append(object?.page || object);
+            }
+            append('endobj\n');
+        }
+        const xrefOffset = byteLength;
+        append(`xref\n0 ${objects.length}\n0000000000 65535 f \n`);
+        for (let id = 1; id < objects.length; id++) append(String(offsets[id]).padStart(10, '0') + ' 00000 n \n');
+        append(`trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+        return new Blob(parts, { type: 'application/pdf' });
     }
 
     function blobToDataUrl(blob) {
@@ -653,12 +1133,18 @@
 
     // ==================== Download Execution ====================
     async function downloadCovers(items, headers, task) {
+        if (!Array.isArray(items) || items.length > CONFIG.MAX_COVER_PAGES) throw new Error('课件页数超出安全上限');
+        if (items.some(([, url]) => !isAllowedImageUrl(url))) throw new Error('课件包含未授权的图片地址');
         const results = new Array(items.length);
         let failedCount = 0;
+        let totalBytes = 0;
         uiLog(`[${task.name}] 正在下载 ${items.length} 张图片（最多共享 ${CONFIG.MAX_WORKERS} 个连接）`);
         await runPool(items, CONFIG.MAX_WORKERS, async ([page, url], index) => {
             try {
-                results[index] = await gmDownloadImage(url, headers);
+                const image = await gmDownloadImage(url, headers);
+                totalBytes += image.size;
+                if (totalBytes > CONFIG.MAX_COURSE_BYTES) throw new Error('课件总大小超出安全上限');
+                results[index] = image;
                 task.downloaded++;
                 refreshPendingUI();
             } catch (err) {
@@ -688,27 +1174,52 @@
     function validateRange(resp, start, end, total) {
         const range = contentRange(resp);
         if (resp.status !== 206 || !range || range.start !== start || range.end !== end ||
-            range.total !== total || resp.response?.size !== end - start + 1) {
+            range.total !== total || total > CONFIG.MAX_VIDEO_BYTES || resp.response?.size !== end - start + 1) {
             throw new Error('服务器返回的视频分段不一致');
         }
     }
 
-    function validateFullVideo(resp) {
+    async function validateMp4Blob(blob) {
+        if (!(blob instanceof Blob) || !blob.size || blob.size > CONFIG.MAX_VIDEO_BYTES) throw new Error('视频文件大小异常');
+        const bytes = new Uint8Array(await blob.slice(0, 256).arrayBuffer());
+        let valid = false;
+        let offset = 0;
+        for (let box = 0; box < 8 && offset + 8 <= bytes.length;) {
+            const size = ((bytes[offset] << 24) >>> 0) + (bytes[offset + 1] << 16)
+                + (bytes[offset + 2] << 8) + bytes[offset + 3];
+            const type = String.fromCharCode(...bytes.slice(offset + 4, offset + 8));
+            if (type === 'ftyp') {
+                valid = true;
+                break;
+            }
+            if (size < 8 || offset + size > bytes.length) break;
+            offset += size;
+            box++;
+        }
+        if (!valid) throw new Error('视频内容不是有效的 MP4');
+        return blob;
+    }
+
+    async function validateFullVideo(resp) {
+        validateFinalMediaUrl(resp, isVideoUrl);
         const length = Number(responseHeader(resp, 'content-length'));
         if (resp.status !== 200 || !resp.response?.size || responseHeader(resp, 'content-range') ||
-            (length > 0 && resp.response.size !== length)) {
+            (length > 0 && resp.response.size !== length) || resp.response.size > CONFIG.MAX_VIDEO_BYTES) {
             throw new Error('视频响应不完整');
         }
-        return resp.response;
+        return validateMp4Blob(resp.response);
     }
 
     async function downloadVideo(videoUrl, headers, task) {
+        if (!isVideoUrl(videoUrl)) throw new Error('录播地址不在允许范围内');
         const baseHeaders = { ...headers, Accept: '*/*', 'Accept-Encoding': 'identity' };
         const fullDownload = async () => {
             task.downloaded = 0;
             task.total = 0;
             const resp = await withRetry(() => requestBlob(videoUrl, baseHeaders, {
                 timeout: CONFIG.VIDEO_TIMEOUT_MS,
+                anonymous: true,
+                maxBytes: CONFIG.MAX_VIDEO_BYTES,
                 onProgress: p => {
                     task.downloaded = p.loaded;
                     task.total = p.lengthComputable ? p.total : 0;
@@ -722,7 +1233,7 @@
         try {
             first = await withRetry(() => requestBlob(videoUrl, {
                 ...baseHeaders, Range: `bytes=0-${CONFIG.VIDEO_CHUNK_BYTES - 1}`,
-            }, { timeout: CONFIG.VIDEO_TIMEOUT_MS, onProgress: p => {
+            }, { timeout: CONFIG.VIDEO_TIMEOUT_MS, anonymous: true, onProgress: p => {
                 task.downloaded = p.loaded;
                 refreshPendingUI();
             } }));
@@ -731,11 +1242,13 @@
             uiLog(`[${task.name}] 分段请求被拒绝，改用单连接下载`, 'warn');
             return fullDownload();
         }
+        validateFinalMediaUrl(first, isVideoUrl);
         if (first.status === 200) {
             uiLog(`[${task.name}] 服务器忽略分段请求，直接使用已返回的完整文件`);
             return validateFullVideo(first); // Do not download this full file a second time.
         }
         const range = contentRange(first);
+        if (range && range.total > CONFIG.MAX_VIDEO_BYTES) throw new Error('视频文件大小异常');
         try {
             if (!range) throw new Error('响应缺少分段范围信息');
             validateRange(first, 0, Math.min(CONFIG.VIDEO_CHUNK_BYTES, range.total) - 1, range.total);
@@ -764,11 +1277,12 @@
                     const resp = await withRetry(() => requestBlob(videoUrl, {
                         ...baseHeaders, Range: `bytes=${start}-${end}`,
                         ...(validator ? { 'If-Range': validator } : {}),
-                    }, { timeout: CONFIG.VIDEO_TIMEOUT_MS, group, requirePartial: true, onProgress: p => {
+                    }, { timeout: CONFIG.VIDEO_TIMEOUT_MS, group, requirePartial: true, anonymous: true, onProgress: p => {
                         progress.set(start, Math.min(p.loaded, end - start + 1));
                         task.downloaded = first.response.size + [...progress.values()].reduce((a, b) => a + b, 0);
                         refreshPendingUI();
                     } }), group);
+                    validateFinalMediaUrl(resp, isVideoUrl);
                     validateRange(resp, start, end, range.total);
                     if (etag && responseHeader(resp, 'etag') && responseHeader(resp, 'etag') !== etag) {
                         throw new Error('下载过程中视频内容发生变化');
@@ -781,7 +1295,7 @@
             });
             const blob = new Blob(chunks, { type: responseHeader(first, 'content-type') || 'video/mp4' });
             if (blob.size !== range.total) throw new Error('视频文件大小不一致');
-            return blob;
+            return validateMp4Blob(blob);
         } catch (err) {
             cancelAll();
             chunks.length = 0;
@@ -792,10 +1306,12 @@
     }
 
     async function executeOneJob(item) {
-        const { name, type, source, headers } = item;
+        const { name, type } = item;
         const task = { name, type, total: 0, downloaded: 0 };
         STATE.activeTasks.set(item.id, task);
         refreshPendingUI();
+        const source = await resolvePendingSource(item);
+        const headers = item.headers || {};
         if (type === 'video') {
             const videoBlob = await downloadVideo(source, headers, task);
             retainFile(item, videoBlob, sanitizeFilename(name.replace(/\.mp4$/i, '')) + '.mp4');
@@ -810,6 +1326,45 @@
             retainFile(item, pdfBlob, sanitizeFilename(name) + '.pdf');
         }
         uiLog(`[${name}] 数据已就绪，等待确认保存`);
+    }
+
+    async function resolvePendingSource(item) {
+        if (item.source) return item.source;
+        const recovery = validRecovery(item.recovery);
+        if (!recovery) throw new Error('刷新后缺少可恢复信息，请重新打开对应课件或录播');
+        if (recovery.kind === 'ppt') {
+            let payload;
+            if (recovery.lessonId && recovery.presentationId) {
+                payload = await pageRequestJSON(CONFIG.PPT_URL, buildApiHeaders(), {
+                    lesson_id: recovery.lessonId,
+                    presentationId: recovery.presentationId,
+                    front_time: String(Date.now()),
+                });
+            } else if (recovery.apiUrl) {
+                payload = await pageRequestJSON(recovery.apiUrl, buildApiHeaders());
+            }
+            if (!loadCoverItems(payload).length) throw new Error('无法用当前会话恢复课件，请重新打开课件');
+            item.source = payload;
+            item.headers = {};
+            return payload;
+        }
+        if (recovery.kind === 'video') {
+            for (const entry of PAGE_WINDOW.performance?.getEntriesByType('resource') || []) {
+                try {
+                    const url = new URL(entry.name, location.href);
+                    const matchingId = recovery.presentationId
+                        && extractPresentationIdFromVideoUrl(url.href) === recovery.presentationId;
+                    const matchingPath = !recovery.presentationId && recovery.pathHash
+                        && shortFingerprint(url.pathname) === recovery.pathHash;
+                    if (url.hostname === recovery.host && (matchingId || matchingPath) && isVideoUrl(url.href)) {
+                        item.source = url.href;
+                        return item.source;
+                    }
+                } catch (err) {}
+            }
+            throw new Error('录播签名已失效，请重新打开录播以采集新地址');
+        }
+        throw new Error('刷新后缺少可恢复信息，请重新打开对应资源');
     }
 
     async function processDownloadQueue() {
@@ -840,7 +1395,7 @@
     // ==================== Add to Pending List ====================
     function chineseName(name) {
         return String(name || '未命名资源').replace(/^\[Courseware\]/, '[课件]')
-            .replace(/^\[Recording\]/, '[录播]').replace(/_(\d+)pages$/, '_$1页');
+            .replace(/^\[Recording\]/, '[录播]').replace(/_(\d+)pages$/, '_$1页').slice(0, 300);
     }
 
     function coursewareSignature(source) {
@@ -855,7 +1410,7 @@
         return [...STATE.pendingItems, ...STATE.runningItems.values(), ...STATE.readyFiles.values()].some(matches);
     }
 
-    async function addPendingItem(name, source, headers, type = 'ppt', key, { recover = false } = {}) {
+    async function addPendingItem(name, source, headers, type = 'ppt', key, { recover = false, recovery = null } = {}) {
         name = chineseName(name);
         const added = await mutateState(() => {
             if (type === 'ppt' && coursewareAlreadyListed(key, source)) {
@@ -869,7 +1424,8 @@
             }
             if (key) STATE.processedKeys.add(key);
             const id = createItemId();
-            STATE.pendingItems.push({ id, name, type, captureKey: key, source, headers, checked: true });
+            STATE.pendingItems.push({ id, name, type, captureKey: key, recovery: validRecovery(recovery),
+                source, headers: {}, checked: true });
             return true;
         });
         if (added) uiLog(`${type === 'video' ? '🎬 已捕获录播' : '📄 已捕获课件'}：${name}`);
@@ -880,12 +1436,13 @@
     // ==================== API Response Handling ====================
     async function handleLessonInfo(payload, options = {}) {
         const data = payload.data || {};
-        const lessonId = data.lessonId;
-        const presentationIds = data.presentationIds || [];
-        const lessonName = String(data.lessonName || '未命名课程');
-        const teacherName = String(data.teacherName || '未知教师');
+        const lessonId = String(data.lessonId || '');
+        const presentationIds = (Array.isArray(data.presentationIds) ? data.presentationIds : [])
+            .map(value => String(value)).filter(value => /^[\w-]{1,200}$/.test(value)).slice(0, 100);
+        const lessonName = String(data.lessonName || '未命名课程').slice(0, 200);
+        const teacherName = String(data.teacherName || '未知教师').slice(0, 100);
 
-        if (!lessonId || !Array.isArray(presentationIds)) {
+        if (!/^[\w-]{1,200}$/.test(lessonId) || !Array.isArray(data.presentationIds)) {
             setCoursewareStatus('课程信息缺少 lessonId 或 presentationIds，等待页面的直接课件接口', 'warn');
             return;
         }
@@ -894,8 +1451,6 @@
 
         // Record current courseware context for subsequent video naming
         STATE.activeLesson = { lessonName, teacherName };
-
-        const headers = buildApiHeaders();
 
         await runPool(presentationIds, CONFIG.MAX_CONCURRENT_JOBS, async (presentationId, i) => {
             const key = `lesson:${lessonId}:${presentationId}`;
@@ -925,9 +1480,11 @@
             };
 
             try {
-                const pptPayload = await gmRequestJSON(CONFIG.PPT_URL, headers, params);
+                const pptPayload = await pageRequestJSON(CONFIG.PPT_URL, buildApiHeaders(), params);
                 if (!loadCoverItems(pptPayload).length) throw new Error('接口未返回课件页面');
-                await addPendingItem(name, pptPayload, headers, 'ppt', key, options);
+                await addPendingItem(name, pptPayload, {}, 'ppt', key, {
+                    ...options, recovery: { kind: 'ppt', lessonId: String(lessonId), presentationId: String(presentationId) },
+                });
             } catch (e) {
                 setCoursewareStatus(`获取课件失败：${e.message}；仍会监听页面已登录会话的直接课件响应`, 'error');
             } finally {
@@ -943,14 +1500,15 @@
         }
         markCourseActivity();
         const data = payload.data || {};
-        const activityId = data.activityId || data.activity_id || 'unknown';
+        const activityId = String(data.activityId || data.activity_id || 'unknown').slice(0, 200);
         const slides = data.slides || [];
         const pages = slides.length;
-        const title = '[Courseware] ' + String(data.title || 'fetch') + `_${pages}pages`;
+        const title = '[Courseware] ' + String(data.title || 'fetch').slice(0, 200) + `_${pages}pages`;
 
         const key = `fetch:${activityId}:${title}:${pages}`;
-        const headers = buildApiHeaders();
-        return addPendingItem(title, payload, headers, 'ppt', key, options);
+        return addPendingItem(title, payload, {}, 'ppt', key, {
+            ...options, recovery: { kind: 'ppt', apiUrl: safeApiRecoveryUrl(options.url) },
+        });
     }
 
     function handlePpt(url, payload, options = {}) {
@@ -962,13 +1520,32 @@
         markCourseActivity();
         const params = new URL(url, location.href).searchParams;
         const data = payload.data || {};
-        const lessonId = params.get('lesson_id') || params.get('lessonId') || data.lessonId;
-        const presentationId = params.get('presentationId') || params.get('presentation_id') || data.presentationId;
+        const lessonIdRaw = String(params.get('lesson_id') || params.get('lessonId') || data.lessonId || '');
+        const presentationIdRaw = String(params.get('presentationId') || params.get('presentation_id') || data.presentationId || '');
+        const lessonId = /^[\w-]{1,200}$/.test(lessonIdRaw) ? lessonIdRaw : '';
+        const presentationId = /^[\w-]{1,200}$/.test(presentationIdRaw) ? presentationIdRaw : '';
         const context = STATE.presentationIdToContext[presentationId];
         const name = context?.fullName || `[课件] ${data.title || data.lessonName || '课堂课件'}${presentationId ? '_' + presentationId : ''}`;
         // The same key as lesson-info's follow-up request avoids adding it twice.
-        const key = lessonId && presentationId ? `lesson:${lessonId}:${presentationId}` : `ppt:${apiRequestKey(url)}`;
-        return addPendingItem(name, payload, buildApiHeaders(), 'ppt', key, options);
+        const key = lessonId && presentationId ? `lesson:${lessonId}:${presentationId}`
+            : `ppt:${safeApiRecoveryUrl(url) || new URL(url, location.href).origin + new URL(url, location.href).pathname}`;
+        return addPendingItem(name, payload, {}, 'ppt', key, {
+            ...options, recovery: { kind: 'ppt', lessonId: lessonId || '', presentationId: presentationId || '', apiUrl: safeApiRecoveryUrl(url) },
+        });
+    }
+
+    function safeApiRecoveryUrl(value) {
+        if (!value) return '';
+        try {
+            const url = new URL(value, location.href);
+            if (!apiEndpoint(url.href)) return '';
+            const safe = new URL(url.origin + url.pathname);
+            for (const name of ['lesson_id', 'lessonId', 'presentationId', 'presentation_id', 'activityId', 'activity_id']) {
+                const item = url.searchParams.get(name);
+                if (item && item.length <= 200) safe.searchParams.set(name, item);
+            }
+            return safe.href;
+        } catch (err) { return ''; }
     }
 
     // ==================== Network Interception ====================
@@ -1003,7 +1580,10 @@
             // Do not clone/read unrelated responses (especially large video bodies).
             try {
                 if (apiEndpoint(url)) {
-                    response.clone().text().then(text => processApiResponse(url, JSON.parse(text)))
+                    response.clone().text().then(text => {
+                        if (text.length > CONFIG.MAX_API_BYTES) throw new Error('接口响应过大');
+                        return processApiResponse(url, JSON.parse(text));
+                    })
                         .catch(err => setCoursewareStatus('接口响应读取失败：' + err.message, 'error'));
                 }
             } catch (err) { console.warn('[Rainclassroom] Response capture failed:', err); }
@@ -1027,8 +1607,12 @@
                     const currentUrl = urls.get(this);
                     if (!apiEndpoint(currentUrl)) return;
                     try {
+                        const textResponse = (!this.responseType || this.responseType === 'text') ? this.responseText : '';
+                        if (textResponse.length > CONFIG.MAX_API_BYTES) {
+                            throw new Error('接口响应过大');
+                        }
                         const json = this.responseType === 'json' ? this.response
-                            : (!this.responseType || this.responseType === 'text') ? JSON.parse(this.responseText) : null;
+                            : (!this.responseType || this.responseType === 'text') ? JSON.parse(textResponse) : null;
                         if (json) Promise.resolve(processApiResponse(currentUrl, json))
                             .catch(err => setCoursewareStatus('课件采集失败：' + err.message, 'error'));
                     } catch (err) { setCoursewareStatus('接口响应读取失败：' + err.message, 'error'); }
@@ -1077,7 +1661,7 @@
 
         if (endpoint === CONFIG.FETCH_URL) {
             uiLog('已捕获课件接口');
-            return Promise.resolve(handleFetch(json, options)).catch(err => setCoursewareStatus(err.message, 'error'));
+            return Promise.resolve(handleFetch(json, { ...options, url })).catch(err => setCoursewareStatus(err.message, 'error'));
         }
         if (endpoint === CONFIG.PPT_URL) {
             uiLog('已捕获直接课件接口');
@@ -1093,7 +1677,7 @@
         if (typeof url !== 'string') return false;
         try {
             const parsed = new URL(url, location.href);
-            return ['https:', 'http:'].includes(parsed.protocol) && CONFIG.VIDEO_SOURCES.some(src =>
+            return parsed.protocol === 'https:' && !parsed.username && !parsed.password && CONFIG.VIDEO_SOURCES.some(src =>
                 parsed.hostname === src.host && parsed.pathname.startsWith(src.pathPrefix));
         } catch (e) { return false; }
     }
@@ -1184,7 +1768,10 @@
             return;
         }
         markCourseActivity();
-        const key = 'video:' + videoUrl;
+        const parsedVideo = new URL(videoUrl);
+        const presentationId = extractPresentationIdFromVideoUrl(videoUrl) || '';
+        const pathHash = shortFingerprint(parsedVideo.pathname);
+        const key = 'video:' + parsedVideo.hostname + ':' + pathHash;
         if (STATE.processedKeys.has(key)) return;
 
         // Try to associate with courseware context for naming
@@ -1204,7 +1791,9 @@
             'Origin': 'https://pro.yuketang.cn',
         };
 
-        addPendingItem(name, videoUrl, headers, 'video', key).catch(err => uiLog(err.message, 'error'));
+        addPendingItem(name, videoUrl, headers, 'video', key, {
+            recovery: { kind: 'video', host: parsedVideo.hostname, presentationId, pathHash },
+        }).catch(err => uiLog(err.message, 'error'));
     }
 
     /**
@@ -1351,7 +1940,7 @@
                 if (isVideoUrl(url)) handleVideoUrl(url);
             });
         }
-        // @require can delay injection until the initial requests are finished.
+        // Injection can happen after the site has already issued its initial requests.
         // Replay only observed, allowlisted read APIs; never guess lesson IDs.
         const latest = new Map();
         for (const entry of PAGE_WINDOW.performance?.getEntriesByType('resource') || []) {
@@ -1373,8 +1962,10 @@
     function setupResourceRecovery() {
         const rescan = options => rescanCurrentDocument(options)
             .catch(err => setCoursewareStatus('重新扫描失败：' + err.message, 'error'));
-        coordinatorDocument()?.addEventListener(FRAME_CHANNEL + ':rescan', event => {
-            const data = parseFrameEvent(event) || {};
+        listenChannel(['rescan'], body => {
+            if (body.targetFrame && body.targetFrame !== frameId) return;
+            if (!consumeChannelCommand(body.id)) return;
+            const data = body.payload || {};
             rescan({ force: true, recover: data.recover === true, coursewareOnly: data.coursewareOnly === true });
         });
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => rescan(), { once: true });
@@ -1572,7 +2163,9 @@
         syncPanelVisibility();
         setCoursewareStatus('已请求重新采集课件；若没有新的接口记录，请重新打开课件或刷新课程页');
         // Restore only courseware; do not clear videos, selections or saved counts.
-        emitFrameEvent(FRAME_CHANNEL + ':rescan', { recover: true, coursewareOnly: true });
+        rescanCurrentDocument({ force: true, recover: true, coursewareOnly: true })
+            .catch(err => setCoursewareStatus('重新采集课件失败：' + err.message, 'error'));
+        sendToFrames('rescan', { recover: true, coursewareOnly: true }).catch(() => {});
     }
 
     function onClearAll(resetRecords = false) {
@@ -1703,7 +2296,7 @@
         const panelHTML = `
         <div id="rc-panel-container">
             <div id="rc-panel-header">
-                <span>雨课堂助手 <small>1.2.1</small></span>
+                <span>雨课堂助手 <small>1.3.0</small></span>
                 <div>
                     <button id="rc-btn-minimize" title="最小化 / 展开">_</button>
                     <button id="rc-btn-close" title="关闭面板（任务继续）">×</button>
@@ -1765,7 +2358,7 @@
                             <label>截止前兜底（秒）<input id="rc-quiz-safety" type="number" min="1" max="30" step="0.1"></label>
                         </div>
                         <label>供应商端点预设<select id="rc-quiz-provider">
-                            <option value="custom">自定义 Compatible API</option>
+                            <option value="custom">自定义路径（使用已授权服务商）</option>
                             <option value="siliconflow">硅基流动</option>
                             <option value="dashscope">阿里云百炼（北京）</option>
                             <option value="deepseek">DeepSeek</option>
@@ -1773,8 +2366,9 @@
                         <label>Base URL<input id="rc-quiz-baseURL" type="url" placeholder="https://供应商地址/v1" autocomplete="off"></label>
                         <label>模型名称<input id="rc-quiz-model" type="text" placeholder="填写服务商可用的模型 ID" autocomplete="off"></label>
                         <label>API Key<input id="rc-quiz-apiKey" type="password" placeholder="填写 API Key" autocomplete="off" spellcheck="false"></label>
+                        <label class="rc-check"><input id="rc-quiz-rememberKey" type="checkbox">记住 API Key 到本设备（脚本管理器存储未加密）</label>
                         <label class="rc-check"><input id="rc-quiz-images" type="checkbox">同时发送题目图片（需支持视觉的模型）</label>
-                        <p class="rc-help">保存后立即生效。随机模式无需 API。自动模式失败时随机兜底；仅显示模式始终不提交。更换端点需重新填写密钥。</p>
+                        <p class="rc-help">不勾选“记住”时，密钥仅保留在本次页面会话。状态与密钥分开存储；更换端点会自动清除旧密钥。自定义端点仅支持脚本头部 @connect 已授权的服务商域名。</p>
                         <div class="rc-form-actions"><button type="submit">保存并应用</button><button id="rc-quiz-stop" type="button">立即停用</button><button id="rc-quiz-clear-key" type="button">清除密钥</button></div>
                     </form>
                     <p id="rc-quiz-message" role="status"></p>
@@ -2055,12 +2649,14 @@
     }
 
     // ==================== Optional classroom answering ====================
-    const QUIZ_SETTINGS_KEY = 'rc_quiz_settings_v1';
+    const QUIZ_SETTINGS_KEY = 'rc_quiz_settings_v2';
+    const QUIZ_SECRET_KEY = 'rc_ai_secret_v2';
+    const LEGACY_QUIZ_SETTINGS_KEY = 'rc_quiz_settings_v1';
     const QUIZ_LEDGER_KEY = 'rc_quiz_attempts_v1';
     const ANSWER_PATH = '/api/v3/lesson/problem/answer';
     const QUIZ_DEFAULTS = {
         enabled: false, mode: 'random', delay: 3, timeout: 20, safety: 3,
-        baseURL: '', model: '', apiKey: '', images: true,
+        baseURL: '', model: '', apiKey: '', images: false, rememberKey: false, endpointBinding: '',
     };
     const AI_PRESETS = {
         custom: ['', ''],
@@ -2068,6 +2664,14 @@
         dashscope: ['https://dashscope.aliyuncs.com/compatible-mode/v1', ''],
         deepseek: ['https://api.deepseek.com', ''],
     };
+    const ALLOWED_AI_HOSTS = new Set([
+        'api.siliconflow.cn',
+        'dashscope.aliyuncs.com',
+        'api.deepseek.com',
+        'localhost',
+        '127.0.0.1',
+        '[::1]',
+    ]);
     let quizSettings = { ...QUIZ_DEFAULTS };
     const localSlides = new Map();
     const localQuestions = new Map();
@@ -2079,6 +2683,39 @@
     let quizLesson = '';
     let quizMessage = '答题未开启';
     let quizRevision = 0;
+    function quizEndpointBinding(settings) {
+        if (!settings || settings.mode === 'random' || !settings.baseURL) return '';
+        try { return aiEndpoint(settings.baseURL); } catch (err) { return ''; }
+    }
+
+    function persistQuizSettings() {
+        const stored = { ...quizSettings, apiKey: '' };
+        sharedStorageSet(QUIZ_SETTINGS_KEY, stored);
+        if (hasManagerStorage) {
+            const secret = quizSettings.rememberKey && quizSettings.apiKey
+                ? { endpoint: quizEndpointBinding(quizSettings), key: quizSettings.apiKey } : null;
+            GM_setValue(QUIZ_SECRET_KEY, secret);
+        }
+        sharedStorageSet(LEGACY_QUIZ_SETTINGS_KEY, null);
+    }
+
+    function loadQuizSettings() {
+        let stored = sharedStorageGet(QUIZ_SETTINGS_KEY, null);
+        const legacy = sharedStorageGet(LEGACY_QUIZ_SETTINGS_KEY, null);
+        const usedLegacy = !stored && legacy && typeof legacy === 'object';
+        if (usedLegacy) stored = legacy;
+        const settings = validateQuizSettings({ ...QUIZ_DEFAULTS, ...(stored || {}) }, { allowMissingKey: true });
+        settings.apiKey = '';
+        const binding = quizEndpointBinding(settings);
+        const secret = hasManagerStorage ? GM_getValue(QUIZ_SECRET_KEY, null) : null;
+        if (settings.rememberKey && secret && typeof secret.key === 'string'
+            && secret.endpoint === binding) settings.apiKey = secret.key.trim().slice(0, 8192);
+        else if (usedLegacy && typeof stored.apiKey === 'string') settings.apiKey = stored.apiKey.trim();
+        else if (secret && secret.endpoint !== binding) settings.apiKey = '';
+        if (settings.enabled && settings.mode !== 'random' && !settings.apiKey) settings.enabled = false;
+        return validateQuizSettings(settings, { allowMissingKey: true });
+    }
+
     function applyQuizSettings(settings) {
         quizRevision++;
         quizSettings = validateQuizSettings(settings);
@@ -2102,12 +2739,12 @@
         }
         const field = key => document.getElementById('rc-quiz-' + key);
         for (const key of ['mode', 'delay', 'timeout', 'safety', 'baseURL', 'model']) field(key).value = quizSettings[key];
-        for (const key of ['enabled', 'images']) field(key).checked = quizSettings[key];
-        const keyPlaceholder = () => { field('apiKey').placeholder = quizSettings.apiKey ? '已保存；留空保留原密钥' : '填写 API Key'; };
+        for (const key of ['enabled', 'images', 'rememberKey']) field(key).checked = quizSettings[key];
+        const keyPlaceholder = () => { field('apiKey').placeholder = quizSettings.apiKey ? '已有密钥；留空保留' : '填写 API Key'; };
         keyPlaceholder();
         const updateModeFields = () => {
             const random = field('mode').value === 'random';
-            for (const key of ['provider', 'baseURL', 'model', 'apiKey', 'images', 'timeout']) field(key).disabled = random;
+            for (const key of ['provider', 'baseURL', 'model', 'apiKey', 'rememberKey', 'images', 'timeout']) field(key).disabled = random;
             field('delay').disabled = !random;
             field('safety').disabled = field('mode').value === 'ai-display';
         };
@@ -2122,12 +2759,15 @@
             try {
                 const input = { ...quizSettings };
                 for (const key of ['mode', 'delay', 'timeout', 'safety', 'baseURL', 'model']) input[key] = field(key).value;
-                for (const key of ['enabled', 'images']) input[key] = field(key).checked;
+                for (const key of ['enabled', 'images', 'rememberKey']) input[key] = field(key).checked;
                 const enteredKey = field('apiKey').value.trim();
-                input.apiKey = enteredKey || (input.baseURL.trim() === quizSettings.baseURL ? quizSettings.apiKey : '');
+                const nextBinding = quizEndpointBinding(input);
+                const previousBinding = quizSettings.endpointBinding || quizEndpointBinding(quizSettings);
+                input.apiKey = enteredKey || (nextBinding && nextBinding === previousBinding ? quizSettings.apiKey : '');
+                input.endpointBinding = nextBinding;
                 const settings = validateQuizSettings(input);
-                GM_setValue(QUIZ_SETTINGS_KEY, settings);
                 applyQuizSettings(settings);
+                persistQuizSettings();
                 field('apiKey').value = '';
                 keyPlaceholder();
                 setQuizMessage(settings.enabled ? '设置已保存；等待课堂发题。' : '设置已保存；答题已关闭。');
@@ -2136,15 +2776,16 @@
         field('stop').addEventListener('click', () => {
             applyQuizSettings({ ...quizSettings, enabled: false });
             field('enabled').checked = false;
-            try { GM_setValue(QUIZ_SETTINGS_KEY, quizSettings); } catch (err) {}
+            try { persistQuizSettings(); } catch (err) {}
             setQuizMessage('已取消等待中的答题。已发出的提交请求无法撤回。');
         });
         field('clear-key').addEventListener('click', () => {
-            applyQuizSettings({ ...quizSettings, apiKey: '', enabled: false });
+            applyQuizSettings({ ...quizSettings, apiKey: '', enabled: false, rememberKey: false, endpointBinding: '' });
             field('enabled').checked = false;
+            field('rememberKey').checked = false;
             field('apiKey').value = '';
             try {
-                GM_setValue(QUIZ_SETTINGS_KEY, quizSettings);
+                persistQuizSettings();
                 setQuizMessage('密钥已清除，答题已停用。');
             } catch (err) { setQuizMessage('本页密钥已清除，但持久存储更新失败，请在脚本管理器中清除。'); }
             keyPlaceholder();
@@ -2251,7 +2892,7 @@
                 return socket;
             },
         });
-        // @require may finish after the site has opened its socket. The supplied
+        // The script may initialize after the site has opened its socket. The supplied
         // Vue 2 client exposes `socket` on its classroom component; attach to that
         // existing connection rather than making a second authenticated socket.
         setInterval(recoverQuizPage, 1500);
@@ -2378,17 +3019,21 @@
     }
 
     function aiEndpoint(base) {
-        const url = new URL(base);
+        let url;
+        try { url = new URL(base); }
+        catch (err) { throw new Error('Base URL 格式无效'); }
+        const localHost = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
         if (url.username || url.password || url.search || url.hash
-            || (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) {
+            || (url.protocol !== 'https:' && !(url.protocol === 'http:' && localHost))) {
             throw new Error('Base URL 需使用 HTTPS（本机服务允许 HTTP），不能包含密钥或查询参数');
         }
+        if (!ALLOWED_AI_HOSTS.has(url.hostname)) throw new Error('该 AI 端点域名未在脚本 @connect 中授权');
         url.pathname = url.pathname.replace(/\/+$/, '');
         if (!url.pathname.endsWith('/chat/completions')) url.pathname += '/chat/completions';
         return url.href;
     }
 
-    function validateQuizSettings(input) {
+    function validateQuizSettings(input, { allowMissingKey = false } = {}) {
         const s = { ...QUIZ_DEFAULTS, ...input };
         if (!['random', 'ai-auto', 'ai-display'].includes(s.mode)) throw new Error('请选择答题模式');
         for (const [key, min, max] of [['delay', 0, 3600], ['timeout', 1, 300], ['safety', 1, 30]]) {
@@ -2396,13 +3041,17 @@
             if (!Number.isFinite(s[key]) || s[key] < min || s[key] > max) throw new Error('延迟、超时或提前量超出范围');
         }
         s.apiKey = String(s.apiKey || '').trim();
+        if (s.apiKey.length > 8192) throw new Error('API Key 过长');
         s.baseURL = String(s.baseURL || '').trim();
         s.model = String(s.model || '').trim();
+        if (s.baseURL.length > 2048 || s.model.length > 200) throw new Error('Base URL 或模型名称过长');
         s.enabled = s.enabled === true;
         s.images = s.images === true;
+        s.rememberKey = s.rememberKey === true;
+        s.endpointBinding = s.mode === 'random' ? '' : quizEndpointBinding(s);
         if (s.enabled && s.mode !== 'random') {
-            if (!s.apiKey || !s.baseURL || !s.model) throw new Error('AI 模式需填写 API Key、Base URL 和模型名称');
-            aiEndpoint(s.baseURL);
+            if ((!s.apiKey && !allowMissingKey) || !s.baseURL || !s.model) throw new Error('AI 模式需填写 API Key、Base URL 和模型名称');
+            s.endpointBinding = aiEndpoint(s.baseURL);
         }
         return s;
     }
@@ -2417,7 +3066,21 @@
             try {
                 request = GM_xmlhttpRequest({ ...options,
                     onload: response => {
-                        if (response.status < 200 || response.status >= 300) finish(reject, new Error('HTTP ' + response.status));
+                        if (response.status < 200 || response.status >= 300) { finish(reject, new Error('HTTP ' + response.status)); return; }
+                        if (options.method === 'POST' && response.finalUrl) {
+                            try {
+                                const finalUrl = new URL(response.finalUrl);
+                                const localFinal = ['localhost', '127.0.0.1', '[::1]'].includes(finalUrl.hostname);
+                                if (!ALLOWED_AI_HOSTS.has(finalUrl.hostname)
+                                    || (finalUrl.protocol !== 'https:' && !(finalUrl.protocol === 'http:' && localFinal))) {
+                                    finish(reject, new Error('AI 端点重定向到未授权地址'));
+                                    return;
+                                }
+                            } catch (err) { finish(reject, new Error('AI 端点重定向地址无效')); return; }
+                        }
+                        if (options.responseType !== 'blob' && String(response.responseText || '').length > CONFIG.MAX_AI_RESPONSE_BYTES) {
+                            finish(reject, new Error('AI 响应过大'));
+                        }
                         else finish(resolve, response);
                     },
                     onerror: () => finish(reject, new Error('网络请求失败')),
@@ -2478,9 +3141,21 @@
 
     function receiveQuizEvent(event, sourceFrame) {
         if (!IS_TOP_WINDOW || event?.type !== 'question' || !validQuizId(sourceFrame)) return;
-        const incoming = event.question;
-        if (!validQuizId(incoming?.id) || !validQuizId(incoming.lesson) || !Array.isArray(incoming.options)
-            || !(incoming.deadline === null || Number.isFinite(incoming.deadline))) return;
+        const source = event.question;
+        if (!validQuizId(source?.id) || !validQuizId(source?.lesson) || !Array.isArray(source.options)
+            || source.options.length > 100 || !(source.deadline === null || Number.isFinite(source.deadline))) return;
+        const incoming = {
+            id: source.id,
+            lesson: source.lesson,
+            type: Number(source.type),
+            body: String(source.body || '').slice(0, 16000),
+            options: source.options.map(option => ({ key: String(option?.key || ''), value: String(option?.value || '').slice(0, 4000) }))
+                .filter(option => /^[A-Z0-9]{1,8}$/.test(option.key)),
+            image: typeof source.image === 'string' ? source.image.slice(0, 8192) : '',
+            deadline: source.deadline,
+            answered: source.answered === true,
+            closed: source.closed === true,
+        };
         const key = quizKey(incoming.lesson, incoming.id);
         let q = quizQuestions.get(key);
         if (q) {
@@ -2596,21 +3271,30 @@
     }
 
     function dispatchQuizSubmission(q, choices) {
+        const authorization = {
+            id: createItemId(), frameId: q.sourceFrame, enabled: quizSettings.enabled === true,
+            mode: quizSettings.mode, issuedAt: Date.now(), expiresAt: Date.now() + 10000,
+        };
         if (q.sourceFrame === frameId) {
             return new Promise((resolve, reject) => {
                 const timer = setTimeout(() => reject(new Error('提交响应超时')), 15000);
-                submitInSourceFrame(q.key, choices).then(resolve, reject).finally(() => clearTimeout(timer));
+                submitInSourceFrame(q.key, choices, authorization).then(resolve, reject).finally(() => clearTimeout(timer));
             });
         }
         return new Promise((resolve, reject) => {
-            const id = createItemId();
+            const id = authorization.id;
             const timer = setTimeout(() => { submitWaiters.delete(id); reject(new Error('源页面无响应或已关闭')); }, 15000);
-            submitWaiters.set(id, { resolve, reject, timer });
-            emitFrameEvent(FRAME_CHANNEL + ':quiz-submit', { id, frameId: q.sourceFrame, key: q.key, choices });
+            submitWaiters.set(id, { resolve, reject, timer, sourceFrame: q.sourceFrame });
+            sendToFrames('quiz-submit', { id, frameId: q.sourceFrame, key: q.key, choices, authorization }, q.sourceFrame)
+                .catch(err => { clearTimeout(timer); submitWaiters.delete(id); reject(err); });
         });
     }
 
-    async function submitInSourceFrame(key, choices) {
+    async function submitInSourceFrame(key, choices, authorization) {
+        if (!authorization || authorization.enabled !== true || authorization.frameId !== frameId
+            || !['random', 'ai-auto'].includes(authorization.mode) || !Number.isFinite(authorization.expiresAt)
+            || !Number.isFinite(authorization.issuedAt) || Date.now() - authorization.issuedAt > 15000
+            || authorization.expiresAt <= Date.now()) throw new Error('提交授权已失效');
         const q = localQuestions.get(key);
         const slide = q && localSlides.get(q.id);
         if (!q || !slide || q.closed || q.answered || slide.answered || q.submitting
@@ -2634,20 +3318,21 @@
     }
 
     function setupQuizBridge() {
-        const doc = coordinatorDocument();
-        if (!doc) return;
-        doc.addEventListener(FRAME_CHANNEL + ':quiz-submit', event => {
-            const data = parseFrameEvent(event);
-            if (data?.frameId !== frameId) return;
-            submitInSourceFrame(data.key, data.choices).then(result => {
-                emitFrameEvent(FRAME_CHANNEL + ':quiz-result', { id: data.id, result });
-            }).catch(() => emitFrameEvent(FRAME_CHANNEL + ':quiz-result', { id: data.id, error: true }));
+        listenChannel(['quiz-submit'], body => {
+            const data = body.payload;
+            if (!data || data.frameId !== frameId || data.authorization?.id !== data.id
+                || data.authorization?.frameId !== frameId || !consumeChannelCommand(body.id)) return;
+            submitInSourceFrame(data.key, data.choices, data.authorization).then(result => {
+                sendToTop('quiz-result', { id: data.id, result }, false, body.fromFrame).catch(() => {});
+            }).catch(() => sendToTop('quiz-result', { id: data.id, error: true }, false, body.fromFrame).catch(() => {}));
         });
         if (!IS_TOP_WINDOW) return;
-        doc.addEventListener(FRAME_CHANNEL + ':quiz-result', event => {
-            const data = parseFrameEvent(event);
+        listenChannel(['quiz-result'], body => {
+            if (body.targetFrame !== frameId) return;
+            const data = body.payload;
             const pending = data && submitWaiters.get(data.id);
             if (!pending) return;
+            if (pending.sourceFrame !== body.fromFrame) { submitWaiters.delete(data.id); clearTimeout(pending.timer); pending.reject(new Error('提交结果来源不匹配')); return; }
             clearTimeout(pending.timer);
             submitWaiters.delete(data.id);
             if (data.error) pending.reject(new Error('源页面提交失败'));
@@ -2684,21 +3369,37 @@
     // ==================== Initialization ====================
     function init() {
         if (IS_TOP_WINDOW) {
-            try { quizSettings = validateQuizSettings(GM_getValue(QUIZ_SETTINGS_KEY, QUIZ_DEFAULTS)); }
+            let migrationWarning = '';
+            try { quizSettings = loadQuizSettings(); }
             catch (err) { quizSettings = { ...QUIZ_DEFAULTS }; }
+            try {
+                // Migrate the legacy combined settings record without carrying
+                // its plaintext key forward unless the user selected persistence.
+                persistQuizSettings();
+            } catch (err) { migrationWarning = ' 设置迁移未写入脚本存储。'; }
             quizMessage = quizSettings.enabled ? '等待课堂发题；已打开的课堂需刷新一次以捕获连接。' : '答题默认关闭，请按需配置并开启。';
+            quizMessage += migrationWarning;
             if (!navigator.locks) quizMessage += ' 此浏览器不支持跨标签页原子去重，请仅在一个课堂标签页开启答题。';
             if (typeof GM_addValueChangeListener === 'function') {
                 GM_addValueChangeListener(QUIZ_SETTINGS_KEY, (_key, _old, value, remote) => {
                     if (!remote) return;
                     try {
-                        applyQuizSettings(value);
+                        applyQuizSettings(loadQuizSettings());
                         setQuizMessage('已应用其他标签页保存的答题设置。');
+                    } catch (err) { applyQuizSettings({ ...QUIZ_DEFAULTS }); }
+                });
+                GM_addValueChangeListener(QUIZ_SECRET_KEY, (_key, _old, _value, remote) => {
+                    if (!remote) return;
+                    try {
+                        const settings = loadQuizSettings();
+                        applyQuizSettings(settings);
+                        setQuizMessage('已应用其他标签页保存的 API Key 设置。');
                     } catch (err) { applyQuizSettings({ ...QUIZ_DEFAULTS }); }
                 });
             }
             try { selection = JSON.parse(sessionStorage.getItem(SELECTION_KEY) || '{}') || {}; } catch (e) {}
             loadState();
+            purgeLegacyCredentialStorage();
             setupStorageListener();
             setupFrameListener();
             window.addEventListener('storage', event => {
@@ -2748,7 +3449,8 @@
             onClearAll(true).then(() => uiLog('采集记录和待下载列表已清除；待保存文件仍保留')).catch(() => {});
         });
         GM_registerMenuCommand('重新扫描当前页面', () => {
-            emitFrameEvent(FRAME_CHANNEL + ':rescan', {});
+            rescanCurrentDocument().catch(err => setCoursewareStatus('重新扫描失败：' + err.message, 'error'));
+            sendToFrames('rescan', {}).catch(() => {});
         });
         GM_registerMenuCommand('重新采集课件（保留其他任务）', onRecaptureCourseware);
     }

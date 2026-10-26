@@ -6,11 +6,47 @@ const { webcrypto } = require('node:crypto');
 
 const source = fs.readFileSync(require.resolve('../main.js'), 'utf8');
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+const tick = () => new Promise(resolve => setImmediate(resolve));
+async function waitUntil(probe, label, timeout = 1500) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+        if (await probe()) return;
+        await tick();
+    }
+    throw new Error(`Timed out waiting for ${label}`);
+}
 const id = '1774242362959461010';
 const lesson = '1774242215168965248';
 function storage() {
     const map = new Map();
     return { getItem: key => map.get(key) ?? null, setItem: (key, value) => map.set(key, value) };
+}
+function managerStorage() {
+    const data = new Map();
+    return {
+        getValue: (key, fallback) => data.has(key) ? data.get(key) : fallback,
+        setValue: (key, value) => data.set(key, value),
+    };
+}
+function messageChannel() {
+    const listeners = new Map();
+    return {
+        frames: [],
+        addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) || []), fn]); },
+        postMessage(data, origin = '*') {
+            for (const fn of [...(listeners.get('message') || [])]) {
+                Promise.resolve().then(() => fn({ data, origin }));
+            }
+        },
+    };
+}
+function framePair() {
+    const top = messageChannel();
+    const child = messageChannel();
+    top.top = top;
+    child.top = top;
+    top.frames = [child];
+    return { top, child };
 }
 function doc() {
     const listeners = new Map();
@@ -26,7 +62,9 @@ function harness(options = {}) {
     const timers = new Map();
     const requests = [];
     const posts = [];
-    const window = { console, URL, URLSearchParams, Blob, ArrayBuffer, TextDecoder, crypto: webcrypto,
+    const window = { console, URL, URLSearchParams, Blob, ArrayBuffer, TextEncoder, TextDecoder, crypto: webcrypto,
+        atob: value => Buffer.from(value, 'base64').toString('binary'),
+        btoa: value => Buffer.from(value, 'binary').toString('base64'),
         Date: class extends Date { static now() { return now; } },
         setTimeout(fn, delay) { const token = ++serial; timers.set(token, { fn, when: now + delay }); return token; },
         clearTimeout(token) { timers.delete(token); }, setInterval() {},
@@ -37,8 +75,19 @@ function harness(options = {}) {
         GM_xmlhttpRequest(request) { requests.push(request); return { abort() { request.onabort?.(); } }; },
         request: { post: async (url, body) => { posts.push({ url, body }); return { code: 0 }; } },
     };
+    if (options.managerStorage) {
+        window.GM_getValue = options.managerStorage.getValue;
+        window.GM_setValue = options.managerStorage.setValue;
+    }
     window.window = window;
     window.top = options.top || window;
+    if (options.pageWindow) {
+        window.unsafeWindow = options.pageWindow;
+        window.top = options.pageWindow.top;
+        options.pageWindow.document ||= window.document;
+        options.pageWindow.request ||= window.request;
+        options.pageWindow.JSON ||= JSON;
+    }
     vm.createContext(window);
     vm.runInContext(source.replace('    init();', `window.api = {
         captureQuestionSlides, processQuizSocket, receiveQuizEvent, setupQuizBridge, setupFrameListener,
@@ -65,7 +114,7 @@ function harness(options = {}) {
 }
 function enable(h, values = {}) {
     h.applyQuizSettings({ enabled: true, mode: 'random', delay: 3, timeout: 20, safety: 3,
-        apiKey: 'test-key', baseURL: 'https://ai.example/v1', model: 'test-model', images: false, ...values });
+        apiKey: 'test-key', baseURL: 'https://api.deepseek.com/v1', model: 'test-model', images: false, ...values });
 }
 function answer(h, value = '{"answer":["B"],"explanation":"理由"}') {
     const request = h.requests.find(r => r.method === 'POST');
@@ -100,7 +149,7 @@ test('AI display emits compatible anonymous request, shows result and never subm
     await flush();
     assert.equal(h.requests.length, 1);
     const r = h.requests[0];
-    assert.equal(r.url, 'https://ai.example/v1/chat/completions'); assert.equal(r.anonymous, true);
+    assert.equal(r.url, 'https://api.deepseek.com/v1/chat/completions'); assert.equal(r.anonymous, true);
     assert.equal(r.headers.Authorization, 'Bearer test-key');
     assert.equal(JSON.parse(r.data).stream, false);
     assert.ok(!r.data.includes(lesson)); assert.ok(!r.data.includes(id));
@@ -162,10 +211,11 @@ test('malformed AI prose and invalid choices are rejected; multiple choice resul
 test('provider configuration validates API credentials and URL without leaking the key in errors', () => {
     const h = harness();
     assert.throws(() => enable(h, { mode: 'ai-auto', apiKey: '' }), /API Key/);
-    assert.throws(() => h.aiEndpoint('https://key@example.com/v1'));
-    assert.throws(() => h.aiEndpoint('http://example.com/v1'));
+    assert.throws(() => h.aiEndpoint('https://key@api.deepseek.com/v1'));
+    assert.throws(() => h.aiEndpoint('http://api.deepseek.com/v1'));
+    assert.throws(() => h.aiEndpoint('https://example.com/v1'), /未在脚本 @connect 中授权/);
     assert.equal(h.aiEndpoint('http://127.0.0.1:8080/v1/'), 'http://127.0.0.1:8080/v1/chat/completions');
-    assert.equal(h.aiEndpoint('https://example.com/v1/chat/completions'), 'https://example.com/v1/chat/completions');
+    assert.equal(h.aiEndpoint('https://api.deepseek.com/v1/chat/completions'), 'https://api.deepseek.com/v1/chat/completions');
 });
 test('same question in two top-level tabs claims once', async () => {
     const shared = storage();
@@ -175,11 +225,16 @@ test('same question in two top-level tabs claims once', async () => {
     assert.equal(a.posts.length + b.posts.length, 1);
 });
 test('iframe forwards question to one coordinator and submits through the originating frame', async () => {
-    const top = harness(); const child = harness({ top: top.window });
+    const pages = framePair();
+    const manager = managerStorage();
+    const top = harness({ pageWindow: pages.top, managerStorage: manager });
+    const child = harness({ pageWindow: pages.child, managerStorage: manager });
     top.setupFrameListener(); top.setupQuizBridge(); child.setupFrameRelay(); child.setupQuizBridge();
     enable(top); child.capture(); child.unlock();
+    await waitUntil(() => top.quizQuestions.size === 1, 'question relayed to top frame');
     assert.equal(top.quizQuestions.size, 1); assert.equal(child.quizQuestions.size, 0);
     await top.advance(3000);
+    await waitUntil(() => child.posts.length === 1 && /提交成功/.test(top.q().status), 'source-frame submission');
     assert.equal(top.posts.length, 0); assert.equal(child.posts.length, 1);
     assert.match(top.q().status, /提交成功/);
 });

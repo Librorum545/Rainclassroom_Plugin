@@ -23,8 +23,10 @@
     window.WebSocket = FakeSocket;
     let quizCounter = 0;
     let simulatedQuestion = null;
+    window.fixtureSubmissions = [];
     window.request = { post: async (url, payload) => {
-        document.getElementById('quiz-output').textContent = '模拟提交成功：' + JSON.stringify(payload);
+        window.fixtureSubmissions.push({ url, payload });
+        document.getElementById('quiz-output').textContent = `模拟提交成功（${window.fixtureSubmissions.length}）：` + JSON.stringify(payload);
         return { code: 0 };
     } };
     window.GM_registerMenuCommand = (name, callback) => document.addEventListener('DOMContentLoaded', () => {
@@ -45,7 +47,9 @@
             }
             const video = options.url.includes('.mp4');
             const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1ioAAAAASUVORK5CYII='), c => c.charCodeAt(0));
-            const blob = new Blob([video ? 'simulated video bytes' : png], { type: video ? 'video/mp4' : 'image/png' });
+            const mp4 = Uint8Array.from([0, 0, 0, 24, 102, 116, 121, 112, 105, 115, 111, 109,
+                0, 0, 0, 0, 105, 115, 111, 109, 109, 112, 52, 49]);
+            const blob = new Blob([video ? mp4 : png], { type: video ? 'video/mp4' : 'image/png' });
             options.onload({ status: 200, response: blob, responseHeaders: 'Content-Length: ' + blob.size });
         }, 300);
         return { abort() { clearTimeout(timer); options.onabort?.(); } };
@@ -54,6 +58,9 @@
     window.GM_info = { downloadMode: 'browser' };
     const simulatedSaves = [];
     let saveRequests = 0;
+    window.fixtureDiagnostics = { errors: [], saveRequests: () => saveRequests, pendingSaves: () => simulatedSaves.length };
+    window.addEventListener('error', event => window.fixtureDiagnostics.errors.push(String(event.error?.stack || event.message)));
+    window.addEventListener('unhandledrejection', event => window.fixtureDiagnostics.errors.push(String(event.reason?.stack || event.reason)));
     const showSaveRequests = () => {
         document.getElementById('export-status').textContent = `保存请求次数：${saveRequests}；等待回调：${simulatedSaves.length}；${simulatedSaves.map(s => s.name).join('、')}`;
     };
@@ -76,7 +83,7 @@
     window.fetch = async () => new Response(JSON.stringify({ data: {
         activityId: `${location.pathname}-${location.search}-${++captureIndex}`,
         title: `Fixture ${location.pathname} ${captureIndex} <safe text>`,
-        slides: [{ index: 1, cover: 'https://example.test/image.jpg', problem: simulatedQuestion }],
+        slides: [{ index: 1, cover: 'https://fe-static-yuketang.yuketang.cn/image.png', problem: simulatedQuestion }],
     } }), { headers: { 'Content-Type': 'application/json' } });
 </script>
 <script src="/userscript-loader.js"></script>

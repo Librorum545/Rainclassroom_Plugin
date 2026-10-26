@@ -6,6 +6,33 @@ const { webcrypto } = require('node:crypto');
 
 const source = fs.readFileSync(require.resolve('../main.js'), 'utf8');
 const stateKey = 'rc_downloader_state';
+function managerStorage() {
+    const data = new Map();
+    return {
+        getValue: (key, fallback) => data.has(key) ? data.get(key) : fallback,
+        setValue: (key, value) => data.set(key, value),
+    };
+}
+function messageChannel() {
+    const listeners = new Map();
+    return {
+        frames: [],
+        addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) || []), fn]); },
+        postMessage(data, origin = '*') {
+            for (const fn of [...(listeners.get('message') || [])]) {
+                Promise.resolve().then(() => fn({ data, origin }));
+            }
+        },
+    };
+}
+function framePair() {
+    const top = messageChannel();
+    const child = messageChannel();
+    top.top = top;
+    child.top = top;
+    top.frames = [child];
+    return { top, child };
+}
 function memoryStorage() {
     const data = new Map();
     return {
@@ -29,13 +56,24 @@ function testDocument() {
         addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) || []), fn]); },
         createEvent() { return { initCustomEvent(type, _bubbles, _cancelable, detail) { this.type = type; this.detail = detail; } }; },
         dispatchEvent(event) { for (const fn of listeners.get(event.type) || []) fn(event); return true; },
+        createElement(tag) {
+            if (tag !== 'canvas') return {};
+            return {
+                width: 0, height: 0,
+                getContext() { return { fillRect() {}, drawImage() {} }; },
+                toBlob(callback) { callback(new Blob(['JPEG'], { type: 'image/jpeg' })); },
+            };
+        },
     };
 }
 function harness(options = {}) {
     const listeners = new Map();
     const intervals = [];
     const window = {
-        console, Blob, URL, URLSearchParams, crypto: webcrypto, setTimeout, clearTimeout,
+        console, Blob, URL, URLSearchParams, ArrayBuffer, crypto: webcrypto, setTimeout, clearTimeout,
+        TextEncoder, TextDecoder,
+        atob: value => Buffer.from(value, 'base64').toString('binary'),
+        btoa: value => Buffer.from(value, 'binary').toString('base64'),
         setInterval: fn => intervals.push(fn),
         location: new URL('https://pro.yuketang.cn/v2/web/index'),
         navigator: { userAgent: 'test', locks: options.locks || locks() },
@@ -62,6 +100,10 @@ function harness(options = {}) {
         } },
         addEventListener: (type, fn) => listeners.set(type, fn),
     };
+    if (options.managerStorage) {
+        window.GM_getValue = options.managerStorage.getValue;
+        window.GM_setValue = options.managerStorage.setValue;
+    }
     window.window = window;
     window.top = options.top || window;
     if (options.pageWindow) {
@@ -76,7 +118,8 @@ function harness(options = {}) {
             runPool, downloadCovers, downloadVideo, processApiResponse, handleFetch,
             isVideoUrl, isLoginUrl, isLoginScreen, setupFrameListener, setupFrameRelay, withDownloadSlot,
             IS_TOP_WINDOW, apiEndpoint, setupFetchInterceptor, setupXHRInterceptor, setupVideoInterceptor,
-            rescanCurrentDocument, handleVideoUrl, checkVideoElement,
+            rescanCurrentDocument, handleVideoUrl, checkVideoElement, verifyChannelEnvelope,
+            getFrameOutboxSize: () => frameOutbox.size,
             setupResourceRecovery, handleLessonInfo,
             getCoursewareStatus: () => coursewareStatus,
             getEarlyLogs: () => earlyLogs,
@@ -88,7 +131,29 @@ function harness(options = {}) {
     return { ...window.testApi, listeners, intervals, storage: window.localStorage };
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
-const payload = { data: { slides: [{ index: 1, cover: 'https://example.test/1.jpg' }] } };
+const settle = async () => { for (let i = 0; i < 8; i++) await tick(); };
+async function waitUntil(probe, label, timeout = 1500) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+        if (await probe()) return;
+        await tick();
+    }
+    throw new Error(`Timed out waiting for ${label}`);
+}
+const IMAGE_ORIGIN = 'https://fe-static-yuketang.yuketang.cn';
+const VIDEO_URL = 'https://ks-playback.xuetangx.com/liveRecordLive/test.mp4';
+const pngBase = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1ioAAAAASUVORK5CYII=', 'base64');
+function pngBytes(marker = '') { return Buffer.concat([pngBase, Buffer.from(marker)]); }
+function pngBlob(marker = '') { return new Blob([pngBytes(marker)], { type: 'image/png' }); }
+function mp4Bytes(length = 43) {
+    const bytes = Buffer.alloc(length);
+    const header = Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d,
+        0, 0, 0, 0, 0x69, 0x73, 0x6f, 0x6d, 0x6d, 0x70, 0x34, 0x31]);
+    header.copy(bytes, 0, 0, Math.min(length, header.length));
+    for (let i = header.length; i < length; i++) bytes[i] = i - header.length;
+    return bytes;
+}
+const payload = { data: { slides: [{ index: 1, cover: `${IMAGE_ORIGIN}/1.png` }] } };
 
 test('capture accepts both real lesson-info routes and trailing slashes', () => {
     const h = harness();
@@ -232,34 +297,50 @@ test('legacy numeric IDs/unchecked items load; sources exist before publishing m
     await h.addPendingItem('New', payload, {}, 'ppt', 'new');
 });
 
-test('frame captures only dispatch string events on the top document; unrelated endpoints are ignored', () => {
+test('frame captures use signed channel messages and ignore unrelated endpoints', async () => {
+    const pages = framePair();
+    const manager = managerStorage();
     const messages = [];
-    const topDoc = testDocument();
-    topDoc.addEventListener('rc-downloader-capture-v1', event => messages.push(event.detail));
-    const h = harness({ top: { document: topDoc } });
-    h.processApiResponse(h.CONFIG.FETCH_URL, payload);
-    h.processApiResponse('https://evil.test/lesson/presentation/fetch', payload);
+    const originalPost = pages.top.postMessage;
+    pages.top.postMessage = (data, origin) => { messages.push(data); originalPost(data, origin); };
+    const top = harness({ pageWindow: pages.top, managerStorage: manager });
+    const child = harness({ pageWindow: pages.child, managerStorage: manager });
+    top.setupFrameListener();
+    child.setupFrameRelay();
+    child.processApiResponse(child.CONFIG.FETCH_URL, payload);
+    child.processApiResponse('https://evil.test/lesson/presentation/fetch', payload);
+    await settle();
     assert.equal(messages.length, 1);
     assert.equal(typeof messages[0], 'string');
-    assert.equal(JSON.parse(messages[0]).url, h.CONFIG.FETCH_URL);
-    assert.equal(h.storage.getItem(stateKey), null);
-    assert.equal(h.STATE.pendingItems.length, 0);
-    assert.equal(h.isVideoUrl('https://evil.test/ks-playback.xuetangx.com/liveRecordLive/v.mp4'), false);
+    const envelope = JSON.parse(messages[0]);
+    assert.equal(envelope.version, 2);
+    assert.match(envelope.signature, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(JSON.parse(envelope.body).channel, 'rc-downloader-channel-v2');
+    assert.equal(top.STATE.pendingItems.length, 1);
+    assert.equal(child.STATE.pendingItems.length, 0);
+    assert.equal(child.storage.getItem(stateKey), null);
+    assert.equal(child.isVideoUrl('https://evil.test/ks-playback.xuetangx.com/liveRecordLive/v.mp4'), false);
 });
 
 test('sandboxed frame relay stays within its own tab and rejects foreign API URLs', async () => {
-    const page = {}; page.top = page;
-    const h = harness({ pageWindow: page });
-    const otherTab = harness();
+    const firstPages = framePair();
+    const secondPages = framePair();
+    const manager = managerStorage();
+    const messages = [];
+    const originalPost = firstPages.top.postMessage;
+    firstPages.top.postMessage = (data, origin) => { messages.push(data); originalPost(data, origin); };
+    const h = harness({ pageWindow: firstPages.top, managerStorage: manager });
+    const otherTab = harness({ pageWindow: secondPages.top, managerStorage: manager });
+    const child = harness({ pageWindow: firstPages.child, managerStorage: manager });
     h.setupFrameListener(); otherTab.setupFrameListener();
-    const framePage = { top: page };
-    const child = harness({ pageWindow: framePage });
     child.setupFrameRelay();
     child.processApiResponse('https://evil.test/api/v3/lesson/presentation/fetch', payload);
-    await tick();
+    await settle();
     assert.equal(h.STATE.pendingItems.length, 0);
     child.processApiResponse(child.CONFIG.FETCH_URL, payload);
-    await tick();
+    await waitUntil(() => messages.length === 1, 'signed frame message');
+    assert.equal(messages.length, 1);
+    assert.ok(await h.verifyChannelEnvelope(messages[0]));
     assert.equal(h.STATE.pendingItems.length, 1);
     assert.equal(otherTab.STATE.pendingItems.length, 0);
     assert.equal(child.STATE.pendingItems.length, 0);
@@ -267,20 +348,25 @@ test('sandboxed frame relay stays within its own tab and rejects foreign API URL
 });
 
 test('early frame captures retry across sandboxes until the top document acknowledges them', async () => {
+    const pages = framePair();
+    const manager = managerStorage();
     const messages = [];
-    const page = {}; page.top = page;
-    const top = harness({ pageWindow: page });
-    top.window.document.addEventListener('rc-downloader-capture-v1', e => messages.push(JSON.parse(e.detail)));
-    const child = harness({ pageWindow: { top: page } });
+    const originalPost = pages.top.postMessage;
+    pages.top.postMessage = (data, origin) => { messages.push(data); originalPost(data, origin); };
+    const top = harness({ pageWindow: pages.top, managerStorage: manager });
+    const child = harness({ pageWindow: pages.child, managerStorage: manager });
     child.setupFrameRelay();
     child.processApiResponse(child.CONFIG.FETCH_URL, payload);
+    await waitUntil(() => messages.length === 1, 'initial frame message');
     assert.equal(messages.length, 1);
     top.setupFrameListener();
     child.intervals[0]();
-    await tick();
+    await waitUntil(() => messages.length === 2 && top.STATE.pendingItems.length === 1
+        && child.getFrameOutboxSize() === 0, 'frame retry acknowledgement');
     assert.equal(messages.length, 2);
     assert.equal(top.STATE.pendingItems.length, 1);
     child.intervals[0]();
+    await settle();
     assert.equal(messages.length, 2);
 });
 
@@ -333,22 +419,24 @@ test('image requests share a global connection limit and preserve page order', a
         active++; maximum = Math.max(maximum, active);
         setTimeout(() => {
             active--;
-            options.onload({ status: 200, response: new Blob([options.url]) });
-        }, options.url.endsWith('1') ? 15 : 2);
+            const marker = options.url.slice(options.url.lastIndexOf('-') + 1, -4);
+            options.onload({ status: 200, response: pngBlob(marker) });
+        }, options.url.endsWith('1.png') ? 15 : 2);
         return { abort() {} };
     } });
     h.CONFIG.MAX_WORKERS = 3;
-    const items = Array.from({ length: 7 }, (_, i) => [i + 1, 'image-' + (i + 1)]);
+    const items = Array.from({ length: 7 }, (_, i) => [i + 1, `${IMAGE_ORIGIN}/image-${i + 1}.png`]);
     const task = () => ({ name: 'Course', downloaded: 0, total: 7 });
     const [a, b] = await Promise.all([h.downloadCovers(items, {}, task()), h.downloadCovers(items, {}, task())]);
     assert.equal(maximum, 3);
     assert.equal(active, 0);
-    assert.deepEqual(await Promise.all(Array.from(a, blob => blob.text())), items.map(it => it[1]));
+    assert.deepEqual(await Promise.all(Array.from(a, async blob => Buffer.from(await blob.arrayBuffer()))),
+        items.map((_, i) => pngBytes(String(i + 1))));
     assert.equal(b.length, 7);
 });
 
 function videoHarness(mode = 'ranges') {
-    const bytes = Buffer.from(Array.from({ length: 43 }, (_, i) => i));
+    const bytes = mp4Bytes();
     let active = 0, maximum = 0, aborted = 0;
     const calls = [];
     const h = harness({ request: options => {
@@ -381,7 +469,7 @@ function videoHarness(mode = 'ranges') {
 test('video downloads concurrent byte ranges and assembles exact bytes in order', async () => {
     const { h, bytes, calls, metrics } = videoHarness();
     const task = { name: 'Video', downloaded: 0, total: 0 };
-    const blob = await h.downloadVideo('https://example.test/video.mp4', {}, task);
+    const blob = await h.downloadVideo(VIDEO_URL, {}, task);
     assert.deepEqual(Buffer.from(await blob.arrayBuffer()), bytes);
     assert.equal(calls.length, 6);
     assert.equal(metrics().maximum, 3);
@@ -393,7 +481,7 @@ test('video downloads concurrent byte ranges and assembles exact bytes in order'
 
 test('a server ignoring the first Range response is downloaded only once', async () => {
     const { h, bytes, calls } = videoHarness('ignore');
-    const blob = await h.downloadVideo('https://example.test/video.mp4', {}, { name: 'Video' });
+    const blob = await h.downloadVideo(VIDEO_URL, {}, { name: 'Video' });
     assert.deepEqual(Buffer.from(await blob.arrayBuffer()), bytes);
     assert.equal(calls.length, 1);
 });
@@ -401,7 +489,7 @@ test('a server ignoring the first Range response is downloaded only once', async
 for (const mode of ['truncated', 'later-ignore']) {
     test(`${mode} segment cancels parallel work and falls back without corrupting the file`, async () => {
         const { h, bytes, calls, metrics } = videoHarness(mode);
-        const blob = await h.downloadVideo('https://example.test/video.mp4', {}, { name: 'Video' });
+        const blob = await h.downloadVideo(VIDEO_URL, {}, { name: 'Video' });
         assert.deepEqual(Buffer.from(await blob.arrayBuffer()), bytes);
         assert.equal(calls.filter(headers => !headers.Range).length, 1);
         assert.equal(metrics().active, 0);
@@ -451,14 +539,14 @@ test('temporary image failure retries and releases its connection slot', async (
         attempts++;
         setImmediate(() => {
             if (attempts === 1) options.onerror({});
-            else options.onload({ status: 200, response: new Blob(['image']) });
+            else options.onload({ status: 200, response: pngBlob('retry') });
         });
         return { abort() {} };
     } });
     h.CONFIG.MAX_WORKERS = 1;
-    const images = await h.downloadCovers([[1, 'retry']], {}, { name: 'Course', downloaded: 0 });
+    const images = await h.downloadCovers([[1, `${IMAGE_ORIGIN}/retry.png`]], {}, { name: 'Course', downloaded: 0 });
     assert.equal(attempts, 2);
-    assert.equal(await images[0].text(), 'image');
+    assert.deepEqual(Buffer.from(await images[0].arrayBuffer()), pngBytes('retry'));
 });
 
 test('truncated full video response cannot be reported as a successful download', async () => {
@@ -466,7 +554,7 @@ test('truncated full video response cannot be reported as a successful download'
         setImmediate(() => options.onload({ status: 200, response: new Blob(['short']), responseHeaders: 'Content-Length: 100' }));
         return { abort() {} };
     } });
-    await assert.rejects(h.downloadVideo('https://example.test/video', {}, { name: 'Video' }), /视频响应不完整/);
+    await assert.rejects(h.downloadVideo(VIDEO_URL, {}, { name: 'Video' }), /视频响应不完整/);
 });
 
 test('unavailable storage keeps captures usable in memory instead of erasing them on the next change', async () => {
@@ -487,27 +575,33 @@ test('three real jobs download concurrently and save every PDF/video, counting o
         download: options => { saves.push(options); return { abort() {} }; },
     });
     const slides = url => ({ data: { slides: [{ index: 1, cover: url }] } });
-    await h.addPendingItem('[Courseware] 相同名称', slides('https://example.test/a.jpg'), {}, 'ppt', 'a');
-    await h.addPendingItem('[Courseware] 相同名称', slides('https://example.test/b.jpg'), {}, 'ppt', 'b');
-    await h.addPendingItem('[Recording] 测试', 'https://example.test/video.mp4', {}, 'video', 'v');
+    const imageA = `${IMAGE_ORIGIN}/a.png`;
+    const imageB = `${IMAGE_ORIGIN}/b.png`;
+    const video = mp4Bytes(64);
+    await h.addPendingItem('[Courseware] 相同名称', slides(imageA), {}, 'ppt', 'a');
+    await h.addPendingItem('[Courseware] 相同名称', slides(imageB), {}, 'ppt', 'b');
+    await h.addPendingItem('[Recording] 测试', VIDEO_URL, {}, 'video', 'v');
     const jobs = h.onDownloadSelected();
     await tick();
     assert.equal(requests.size, 3, 'all network jobs start without waiting for a save');
-    const respond = (url, text) => requests.get(url).onload({ status: 200, response: new Blob([text]), responseHeaders: `Content-Length: ${text.length}` });
+    const respond = (url, blob) => requests.get(url).onload({ status: 200, response: blob,
+        responseHeaders: `Content-Type: ${blob.type}\r\nContent-Length: ${blob.size}` });
     // Finish the second job first; keep its save pending while the others finish.
-    respond('https://example.test/b.jpg', 'slide-B');
+    respond(imageB, pngBlob('slide-B'));
     await tick(); await tick();
-    respond('https://example.test/video.mp4', 'video-bytes');
-    respond('https://example.test/a.jpg', 'slide-A');
+    respond(VIDEO_URL, new Blob([video], { type: 'video/mp4' }));
+    respond(imageA, pngBlob('slide-A'));
     await jobs;
     assert.equal(saves.length, 1, 'only exports are serialized');
     assert.equal(h.STATE.readyFiles.size, 3);
     assert.equal(h.STATE.totalCompleted, 0);
     assert.equal(h.STATE.pendingItems.length, 0);
     assert.equal(h.STATE.isProcessing, false, 'save waits do not occupy network job slots');
-    for (const expected of ['PDF:slide-B', 'video-bytes', 'PDF:slide-A']) {
+    for (const expected of ['pdf', 'mp4', 'pdf']) {
         const current = saves.at(-1);
-        assert.equal(await (await fetch(current.url)).text(), expected);
+        const bytes = Buffer.from(await (await fetch(current.url)).arrayBuffer());
+        if (expected === 'pdf') assert.equal(bytes.subarray(0, 8).toString(), '%PDF-1.4');
+        else assert.deepEqual(bytes, video);
         assert.equal(current.conflictAction, 'uniquify', 'same names must not overwrite');
         assert.equal(current.saveAs, false);
         current.onload();
@@ -519,6 +613,7 @@ test('three real jobs download concurrently and save every PDF/video, counting o
     await h.whenSavesSettle();
     assert.equal(saves.length, 3);
     assert.equal(saves[0].name, '[课件] 相同名称.pdf');
+    assert.equal(saves[1].name, '[录播] 测试.mp4');
     assert.equal(saves[2].name, saves[0].name);
     assert.equal(h.STATE.readyFiles.size, 0);
     assert.equal(h.STATE.totalCompleted, 3);
@@ -680,7 +775,7 @@ test('legacy fire-and-forget completion count is not displayed as confirmed save
 });
 
 const pptUrl = (id, stamp = 1) => `https://pro.yuketang.cn/api/v3/classroom-report/student/ppt?lesson_id=7&presentationId=${id}&front_time=${stamp}`;
-const pptPayload = id => ({ data: { timelineList: [{ index: 1, cover: `https://example.test/${id}.jpg` }] } });
+const pptPayload = id => ({ data: { timelineList: [{ index: 1, cover: `${IMAGE_ORIGIN}/${id}.png` }] } });
 
 test('direct PPT endpoints from the saved Rain Classroom site are allowlisted without matching foreign hosts', () => {
     const h = harness();
@@ -704,13 +799,14 @@ test('page fetch can capture a direct PPT response without any preceding lesson-
 });
 
 test('iframe direct PPT relay preserves lesson and presentation query IDs and deduplicates with lesson-info', async () => {
-    const topPage = {}; topPage.top = topPage;
-    const top = harness({ pageWindow: topPage });
+    const pages = framePair();
+    const manager = managerStorage();
+    const top = harness({ pageWindow: pages.top, managerStorage: manager });
     top.setupFrameListener();
-    const frame = harness({ pageWindow: { top: topPage } });
+    const frame = harness({ pageWindow: pages.child, managerStorage: manager });
     frame.setupFrameRelay();
     frame.processApiResponse(pptUrl('a'), pptPayload('a'));
-    await tick();
+    await settle();
     assert.equal(top.STATE.pendingItems[0].captureKey, 'lesson:7:a');
     await top.handleLessonInfo({ data: { lessonId: '7', presentationIds: ['a'], lessonName: '测试课', teacherName: '教师' } });
     assert.equal(top.STATE.pendingItems.length, 1);
@@ -795,7 +891,7 @@ test('resource observer avoids re-requesting responses already captured by fetch
 test('recapture restores a courseware suppressed by old records without clearing videos, selection or save count', async () => {
     const h = harness();
     await h.mutateState(() => { h.STATE.processedKeys.add('lesson:7:a'); h.STATE.totalCompleted = 3; });
-    await h.addPendingItem('保留视频', 'https://example.test/video.mp4', {}, 'video', 'video:keep');
+    await h.addPendingItem('保留视频', VIDEO_URL, {}, 'video', 'video:keep');
     h.selectAll(false);
     await h.processApiResponse(pptUrl('a'), pptPayload('a'));
     assert.equal(h.STATE.pendingItems.length, 1);
