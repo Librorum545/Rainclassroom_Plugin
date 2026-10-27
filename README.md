@@ -2,7 +2,7 @@
 
 一个运行在 [雨课堂网页版](https://pro.yuketang.cn/) 的 Tampermonkey 用户脚本，用于下载课程课件和录播，并提供可选的课堂答题辅助。
 
-当前脚本版本为 **1.4.0**。运行时只需要 [`main.js`](main.js)，不依赖其他脚本库、Node.js 或 npm。
+运行时只需要 [`main.js`](main.js)，不依赖其他脚本库、Node.js 或 npm。
 
 ## 功能
 

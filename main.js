@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Rain Classroom Courseware Plugin
 // @name:zh-CN   雨课堂课程助手
-// @namespace    https://github.com/Librorum/Rainclassroom_Plugin
-// @version      1.4.0
+// @namespace    https://github.com/Librorum545/Rainclassroom_Plugin
+// @version      1.4.1
 // @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
 // @description:zh-CN 雨课堂课件与录播下载，可选答题辅助
 // @author       Librorum
