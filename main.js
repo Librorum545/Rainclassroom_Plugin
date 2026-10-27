@@ -2,7 +2,7 @@
 // @name         Rain Classroom Courseware Plugin
 // @name:zh-CN   雨课堂课程助手
 // @namespace    https://github.com/Librorum/Rainclassroom_Plugin
-// @version      1.3.0
+// @version      1.4.0
 // @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
 // @description:zh-CN 雨课堂课件与录播下载，可选答题辅助
 // @author       Librorum
@@ -22,12 +22,7 @@
 // @connect      *.yuketang.cn
 // @connect      xuetangx.com
 // @connect      *.xuetangx.com
-// @connect      api.siliconflow.cn
-// @connect      dashscope.aliyuncs.com
-// @connect      api.deepseek.com
-// @connect      localhost
-// @connect      127.0.0.1
-// @connect      [::1]
+// @connect      *
 // @run-at       document-start
 // @license      MIT
 // ==/UserScript==
@@ -2296,7 +2291,7 @@
         const panelHTML = `
         <div id="rc-panel-container">
             <div id="rc-panel-header">
-                <span>雨课堂助手 <small>1.3.0</small></span>
+                <span>雨课堂助手 <small>1.4.0</small></span>
                 <div>
                     <button id="rc-btn-minimize" title="最小化 / 展开">_</button>
                     <button id="rc-btn-close" title="关闭面板（任务继续）">×</button>
@@ -2358,7 +2353,8 @@
                             <label>截止前兜底（秒）<input id="rc-quiz-safety" type="number" min="1" max="30" step="0.1"></label>
                         </div>
                         <label>供应商端点预设<select id="rc-quiz-provider">
-                            <option value="custom">自定义路径（使用已授权服务商）</option>
+                            <option value="custom">自定义或中转服务</option>
+                            <option value="zhipu">智谱 AI（BigModel）</option>
                             <option value="siliconflow">硅基流动</option>
                             <option value="dashscope">阿里云百炼（北京）</option>
                             <option value="deepseek">DeepSeek</option>
@@ -2368,8 +2364,9 @@
                         <label>API Key<input id="rc-quiz-apiKey" type="password" placeholder="填写 API Key" autocomplete="off" spellcheck="false"></label>
                         <label class="rc-check"><input id="rc-quiz-rememberKey" type="checkbox">记住 API Key 到本设备（脚本管理器存储未加密）</label>
                         <label class="rc-check"><input id="rc-quiz-images" type="checkbox">同时发送题目图片（需支持视觉的模型）</label>
-                        <p class="rc-help">不勾选“记住”时，密钥仅保留在本次页面会话。状态与密钥分开存储；更换端点会自动清除旧密钥。自定义端点仅支持脚本头部 @connect 已授权的服务商域名。</p>
-                        <div class="rc-form-actions"><button type="submit">保存并应用</button><button id="rc-quiz-stop" type="button">立即停用</button><button id="rc-quiz-clear-key" type="button">清除密钥</button></div>
+                        <p class="rc-help">不勾选“记住”时，密钥仅保留在本次页面会话。状态与密钥分开存储；更换端点会自动清除旧密钥。自定义或中转服务会收到 API Key 和题目内容，请只使用可信地址。</p>
+                        <p class="rc-help">连接测试会直接发起一次真实模型会话，并可能产生 API 费用。</p>
+                        <div class="rc-form-actions"><button type="submit">保存并应用</button><button id="rc-quiz-test" type="button">测试 AI 连接</button><button id="rc-quiz-stop" type="button">立即停用</button><button id="rc-quiz-clear-key" type="button">清除密钥</button></div>
                     </form>
                     <p id="rc-quiz-message" role="status"></p>
                     <div id="rc-quiz-results" aria-live="polite"></div>
@@ -2660,19 +2657,13 @@
     };
     const AI_PRESETS = {
         custom: ['', ''],
+        zhipu: ['https://open.bigmodel.cn/api/paas/v4', 'glm-5.3-flash'],
         siliconflow: ['https://api.siliconflow.cn/v1', ''],
         dashscope: ['https://dashscope.aliyuncs.com/compatible-mode/v1', ''],
         deepseek: ['https://api.deepseek.com', ''],
     };
-    const ALLOWED_AI_HOSTS = new Set([
-        'api.siliconflow.cn',
-        'dashscope.aliyuncs.com',
-        'api.deepseek.com',
-        'localhost',
-        '127.0.0.1',
-        '[::1]',
-    ]);
     let quizSettings = { ...QUIZ_DEFAULTS };
+    let aiConnectionTest = null;
     const localSlides = new Map();
     const localQuestions = new Map();
     const quizQuestions = new Map();
@@ -2742,9 +2733,11 @@
         for (const key of ['enabled', 'images', 'rememberKey']) field(key).checked = quizSettings[key];
         const keyPlaceholder = () => { field('apiKey').placeholder = quizSettings.apiKey ? '已有密钥；留空保留' : '填写 API Key'; };
         keyPlaceholder();
+        let testingAI = false;
         const updateModeFields = () => {
             const random = field('mode').value === 'random';
             for (const key of ['provider', 'baseURL', 'model', 'apiKey', 'rememberKey', 'images', 'timeout']) field(key).disabled = random;
+            field('test').disabled = random || testingAI;
             field('delay').disabled = !random;
             field('safety').disabled = field('mode').value === 'ai-display';
         };
@@ -2752,19 +2745,26 @@
         updateModeFields();
         field('provider').addEventListener('change', () => {
             const preset = AI_PRESETS[field('provider').value];
-            if (preset && preset[0]) field('baseURL').value = preset[0];
+            if (preset) {
+                if (preset[0]) field('baseURL').value = preset[0];
+                if (preset[1]) field('model').value = preset[1];
+            }
         });
+        const readFormSettings = enabled => {
+            const input = { ...quizSettings, enabled };
+            for (const key of ['mode', 'delay', 'timeout', 'safety', 'baseURL', 'model']) input[key] = field(key).value;
+            for (const key of ['images', 'rememberKey']) input[key] = field(key).checked;
+            const enteredKey = field('apiKey').value.trim();
+            const nextBinding = quizEndpointBinding(input);
+            const previousBinding = quizSettings.endpointBinding || quizEndpointBinding(quizSettings);
+            input.apiKey = enteredKey || (nextBinding && nextBinding === previousBinding ? quizSettings.apiKey : '');
+            input.endpointBinding = nextBinding;
+            return input;
+        };
         field('form').addEventListener('submit', event => {
             event.preventDefault();
             try {
-                const input = { ...quizSettings };
-                for (const key of ['mode', 'delay', 'timeout', 'safety', 'baseURL', 'model']) input[key] = field(key).value;
-                for (const key of ['enabled', 'images', 'rememberKey']) input[key] = field(key).checked;
-                const enteredKey = field('apiKey').value.trim();
-                const nextBinding = quizEndpointBinding(input);
-                const previousBinding = quizSettings.endpointBinding || quizEndpointBinding(quizSettings);
-                input.apiKey = enteredKey || (nextBinding && nextBinding === previousBinding ? quizSettings.apiKey : '');
-                input.endpointBinding = nextBinding;
+                const input = readFormSettings(field('enabled').checked);
                 const settings = validateQuizSettings(input);
                 applyQuizSettings(settings);
                 persistQuizSettings();
@@ -2773,13 +2773,33 @@
                 setQuizMessage(settings.enabled ? '设置已保存；等待课堂发题。' : '设置已保存；答题已关闭。');
             } catch (err) { setQuizMessage(err.message); }
         });
+        field('test').addEventListener('click', async () => {
+            if (!window.confirm('测试会直接发起一次真实模型会话，并可能产生 API 费用。是否继续？')) return;
+            testingAI = true;
+            updateModeFields();
+            field('test').textContent = '正在测试…';
+            setQuizMessage('正在测试 AI 连接；本次测试会产生一次模型调用费用。');
+            try {
+                const settings = validateQuizSettings(readFormSettings(true));
+                const result = await testAIConnection(settings);
+                setQuizMessage('AI 连接成功：' + result.model + ' 已返回响应。测试请求可能产生费用。');
+            } catch (err) {
+                setQuizMessage('AI 连接失败：' + err.message);
+            } finally {
+                testingAI = false;
+                field('test').textContent = '测试 AI 连接';
+                updateModeFields();
+            }
+        });
         field('stop').addEventListener('click', () => {
+            cancelAIConnectionTest();
             applyQuizSettings({ ...quizSettings, enabled: false });
             field('enabled').checked = false;
             try { persistQuizSettings(); } catch (err) {}
             setQuizMessage('已取消等待中的答题。已发出的提交请求无法撤回。');
         });
         field('clear-key').addEventListener('click', () => {
+            cancelAIConnectionTest();
             applyQuizSettings({ ...quizSettings, apiKey: '', enabled: false, rememberKey: false, endpointBinding: '' });
             field('enabled').checked = false;
             field('rememberKey').checked = false;
@@ -3018,16 +3038,19 @@
         return { choices: values.slice().sort(), explanation };
     }
 
+    function secureAIURL(url, allowQuery = false) {
+        const localHost = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+        return !url.username && !url.password && (allowQuery || (!url.search && !url.hash))
+            && (url.protocol === 'https:' || (url.protocol === 'http:' && localHost));
+    }
+
     function aiEndpoint(base) {
         let url;
         try { url = new URL(base); }
         catch (err) { throw new Error('Base URL 格式无效'); }
-        const localHost = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
-        if (url.username || url.password || url.search || url.hash
-            || (url.protocol !== 'https:' && !(url.protocol === 'http:' && localHost))) {
+        if (!secureAIURL(url)) {
             throw new Error('Base URL 需使用 HTTPS（本机服务允许 HTTP），不能包含密钥或查询参数');
         }
-        if (!ALLOWED_AI_HOSTS.has(url.hostname)) throw new Error('该 AI 端点域名未在脚本 @connect 中授权');
         url.pathname = url.pathname.replace(/\/+$/, '');
         if (!url.pathname.endsWith('/chat/completions')) url.pathname += '/chat/completions';
         return url.href;
@@ -3066,14 +3089,17 @@
             try {
                 request = GM_xmlhttpRequest({ ...options,
                     onload: response => {
-                        if (response.status < 200 || response.status >= 300) { finish(reject, new Error('HTTP ' + response.status)); return; }
+                        if (response.status < 200 || response.status >= 300) {
+                            const error = new Error('HTTP ' + response.status);
+                            error.status = response.status;
+                            finish(reject, error);
+                            return;
+                        }
                         if (options.method === 'POST' && response.finalUrl) {
                             try {
                                 const finalUrl = new URL(response.finalUrl);
-                                const localFinal = ['localhost', '127.0.0.1', '[::1]'].includes(finalUrl.hostname);
-                                if (!ALLOWED_AI_HOSTS.has(finalUrl.hostname)
-                                    || (finalUrl.protocol !== 'https:' && !(finalUrl.protocol === 'http:' && localFinal))) {
-                                    finish(reject, new Error('AI 端点重定向到未授权地址'));
+                                if (!secureAIURL(finalUrl, true)) {
+                                    finish(reject, new Error('AI 端点重定向到不安全的地址'));
                                     return;
                                 }
                             } catch (err) { finish(reject, new Error('AI 端点重定向地址无效')); return; }
@@ -3117,6 +3143,51 @@
         let data;
         try { data = JSON.parse(response.responseText); } catch (err) { throw new Error('AI 响应不是 JSON'); }
         return parseAIAnswer(data?.choices?.[0]?.message?.content, q);
+    }
+
+    function cancelAIConnectionTest() {
+        const job = aiConnectionTest;
+        if (!job) return;
+        job.cancelled = true;
+        for (const cancel of [...job.requests]) cancel();
+    }
+
+    async function testAIConnection(input) {
+        if (aiConnectionTest) throw new Error('已有 AI 连接测试正在进行');
+        const requestedMode = input?.mode || QUIZ_DEFAULTS.mode;
+        const settings = validateQuizSettings({
+            ...QUIZ_DEFAULTS, ...(input || {}), mode: requestedMode === 'random' ? 'ai-display' : requestedMode,
+            enabled: true,
+        });
+        const job = { cancelled: false, requests: new Set() };
+        aiConnectionTest = job;
+        try {
+            const response = await quizRequest({ method: 'POST', url: aiEndpoint(settings.baseURL),
+                anonymous: true, timeout: Math.min(60, Math.max(10, settings.timeout)) * 1000,
+                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + settings.apiKey },
+                data: JSON.stringify({ model: settings.model, stream: false, max_tokens: 1024, messages: [
+                    { role: 'user', content: '这是一次连接测试。请只回复“连接成功”。' },
+                ] }),
+            }, job);
+            let data;
+            try { data = JSON.parse(response.responseText); }
+            catch (err) { throw new Error('AI 响应不是 JSON'); }
+            if (data?.error) throw new Error('AI 服务返回错误');
+            if (!Array.isArray(data?.choices) || data.choices.length === 0) {
+                throw new Error('AI 响应缺少 choices，未返回兼容的对话结果');
+            }
+            return { endpoint: aiEndpoint(settings.baseURL), model: settings.model };
+        } catch (err) {
+            const statusMessages = {
+                401: '认证失败（HTTP 401），请检查 API Key',
+                403: '请求被拒绝（HTTP 403），请检查 API Key 权限',
+                404: '接口或模型不存在（HTTP 404），请检查 Base URL 和模型名称',
+                429: '请求过于频繁或额度不足（HTTP 429）',
+            };
+            throw new Error(statusMessages[err.status] || err.message);
+        } finally {
+            if (aiConnectionTest === job) aiConnectionTest = null;
+        }
     }
 
     function stopQuizJob(q) {

@@ -93,7 +93,7 @@ function harness(options = {}) {
         captureQuestionSlides, processQuizSocket, receiveQuizEvent, setupQuizBridge, setupFrameListener,
         setupFrameRelay, setupQuizSocket, recoverQuizPage, observeAnswerRequest, quizQuestions, localQuestions,
         applyQuizSettings, validateQuizSettings, parseAIAnswer, randomChoices, aiEndpoint, claimQuizAttempt,
-        submitQuizAnswer, quizKey, frameId, IS_TOP_WINDOW,
+        submitQuizAnswer, testAIConnection, quizKey, frameId, IS_TOP_WINDOW,
         settings: () => quizSettings, page: PAGE_WINDOW,
     };`), window);
     const api = window.api;
@@ -213,9 +213,44 @@ test('provider configuration validates API credentials and URL without leaking t
     assert.throws(() => enable(h, { mode: 'ai-auto', apiKey: '' }), /API Key/);
     assert.throws(() => h.aiEndpoint('https://key@api.deepseek.com/v1'));
     assert.throws(() => h.aiEndpoint('http://api.deepseek.com/v1'));
-    assert.throws(() => h.aiEndpoint('https://example.com/v1'), /未在脚本 @connect 中授权/);
+    assert.throws(() => h.aiEndpoint('https://relay.example/v1?token=secret'));
+    assert.equal(h.aiEndpoint('https://relay.example/v1'), 'https://relay.example/v1/chat/completions');
     assert.equal(h.aiEndpoint('http://127.0.0.1:8080/v1/'), 'http://127.0.0.1:8080/v1/chat/completions');
     assert.equal(h.aiEndpoint('https://api.deepseek.com/v1/chat/completions'), 'https://api.deepseek.com/v1/chat/completions');
+    assert.match(source, /^\/\/ @connect\s+\*$/m);
+});
+test('connection test sends one real-session-compatible request and accepts custom relays', async () => {
+    const h = harness();
+    const pending = h.testAIConnection({ mode: 'ai-display', apiKey: 'test-key',
+        baseURL: 'https://relay.example/v1', model: 'relay-model', timeout: 20 });
+    assert.equal(h.requests.length, 1);
+    const request = h.requests[0];
+    assert.equal(request.url, 'https://relay.example/v1/chat/completions');
+    assert.equal(request.anonymous, true);
+    assert.equal(request.headers.Authorization, 'Bearer test-key');
+    const payload = JSON.parse(request.data);
+    assert.equal(payload.model, 'relay-model');
+    assert.equal(payload.stream, false);
+    assert.equal(payload.max_tokens, 1024);
+    assert.equal(payload.messages.length, 1);
+    request.onload({ status: 200, finalUrl: 'https://relay.example/v1/chat/completions',
+        responseText: JSON.stringify({ choices: [{ message: { content: '连接成功' } }] }) });
+    const result = await pending;
+    assert.equal(result.endpoint, 'https://relay.example/v1/chat/completions');
+    assert.equal(result.model, 'relay-model');
+});
+test('connection test reports authentication and unsafe redirect failures', async () => {
+    const h = harness();
+    const unauthorized = h.testAIConnection({ mode: 'ai-display', apiKey: 'test-key',
+        baseURL: 'https://relay.example/v1', model: 'relay-model' });
+    h.requests[0].onload({ status: 401, responseText: '' });
+    await assert.rejects(unauthorized, /认证失败.*401/);
+
+    const redirected = h.testAIConnection({ mode: 'ai-display', apiKey: 'test-key',
+        baseURL: 'https://relay.example/v1', model: 'relay-model' });
+    h.requests[1].onload({ status: 200, finalUrl: 'http://unsafe.example/steal',
+        responseText: '{}' });
+    await assert.rejects(redirected, /不安全的地址/);
 });
 test('same question in two top-level tabs claims once', async () => {
     const shared = storage();

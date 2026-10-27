@@ -282,7 +282,7 @@ test('headless browser fixture covers userscript injection and classroom flows',
             return counts;
         })()`);
         assert.deepEqual(panelCounts, [1, 0, 0]);
-        assert.match(await cdp.evaluate(`document.getElementById('rc-panel-header').textContent`), /雨课堂助手\s*1\.3\.0/);
+        assert.match(await cdp.evaluate(`document.getElementById('rc-panel-header').textContent`), /雨课堂助手\s*1\.4\.0/);
 
         await clickInFrame(cdp, 0, 'login');
         await waitFor(() => cdp.evaluate(`document.getElementById('rc-panel-container').style.display === 'none'`), 'QR overlay to hide panel');
@@ -369,6 +369,12 @@ test('headless browser fixture covers userscript injection and classroom flows',
         await waitFor(() => cdp.evaluate(`document.getElementById('rc-completed-count').textContent === '3' && document.getElementById('rc-unsaved-count').textContent === '0'`), 'retry to confirm all files');
 
         await clickInFrame(cdp, 0, 'rc-tab-answer');
+        const aiTestUi = await cdp.evaluate(`(() => ({
+            hasButton: Boolean(document.getElementById('rc-quiz-test')),
+            hasCostWarning: [...document.querySelectorAll('#rc-answer-view .rc-help')]
+                .some(item => item.textContent.includes('可能产生 API 费用')),
+        }))()`);
+        assert.deepEqual(aiTestUi, { hasButton: true, hasCostWarning: true });
         await cdp.evaluate(`(() => {
             document.getElementById('rc-quiz-enabled').click();
             document.getElementById('rc-quiz-mode').value = 'random';
