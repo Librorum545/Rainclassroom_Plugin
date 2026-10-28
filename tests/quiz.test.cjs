@@ -116,8 +116,8 @@ function enable(h, values = {}) {
     h.applyQuizSettings({ enabled: true, mode: 'random', delay: 3, timeout: 20, safety: 3,
         apiKey: 'test-key', baseURL: 'https://api.deepseek.com/v1', model: 'test-model', images: false, ...values });
 }
-function answer(h, value = '{"answer":["B"],"explanation":"理由"}') {
-    const request = h.requests.find(r => r.method === 'POST');
+function answer(h, value = '{"answer":["B"],"explanation":"理由"}', index = 0) {
+    const request = h.requests.filter(r => r.method === 'POST')[index];
     request.onload({ status: 200, responseText: JSON.stringify({ choices: [{ message: { content: value } }] }) });
 }
 
@@ -179,6 +179,24 @@ test('server now corrects clock skew and teacher extension reschedules fallback'
     h.processQuizSocket({ op: 'extendtime', lessonid: lesson, problem: { prob: id, dt: h.now(), now: h.now(), limit: 30, extend: 20 } });
     await h.advance(7000); assert.equal(h.posts.length, 0);
     await h.advance(20000); assert.equal(h.posts.length, 1);
+});
+test('Vue countdown refreshes an existing question deadline when the teacher changes it', async () => {
+    const document = doc();
+    const problem = { problemId: id, problemType: 1, body: '续时测试', result: null,
+        options: [{ key: 'A', value: '是' }, { key: 'B', value: '否' }] };
+    const root = { lessonID: lesson, problemMap: new Map([[id, { problem }]]) };
+    const component = { problemID: id, oProblem: problem, summary: {}, limit: 60, leaveTime: 10, $parent: root };
+    root.$children = [component];
+    document.querySelectorAll = selector => selector === '#app' ? [{ __vue__: root }] : [];
+    const h = harness({ document });
+    enable(h, { mode: 'random', delay: 60, timeout: 20, safety: 3 });
+    h.capture(); h.unlock({ limit: 10 });
+    await h.advance(1000);
+    component.leaveTime = 30;
+    h.recoverQuizPage();
+    assert.equal(h.q().deadline, h.now() + 30000);
+    await h.advance(6000); assert.equal(h.posts.length, 0);
+    await h.advance(21000); assert.equal(h.posts.length, 1);
 });
 test('teacher close, manual answer and disabling each cancel a pending submission', async () => {
     for (const stop of [h => h.processQuizSocket({ op: 'problemfinished', lessonid: lesson, prob: id }),
@@ -302,10 +320,40 @@ test('AI display failure and timeout never trigger random fallback', async () =>
         assert.equal(h.posts.length, 0); assert.match(h.q().status, /失败|超时/);
     }
 });
-test('AI invalid answer causes random fallback in automatic mode only', async () => {
+test('AI format failures are retried until a valid answer arrives', async () => {
     const h = harness(); enable(h, { mode: 'ai-auto' }); h.capture(); h.unlock();
     await flush(); answer(h, '{"answer":["Z"]}'); await flush();
-    assert.equal(h.posts.length, 1); assert.ok(['A', 'B'].includes(h.posts[0].body.result[0]));
+    assert.equal(h.posts.length, 0);
+    assert.match(h.q().status, /格式无效.*重试/);
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 1);
+    await h.advance(500);
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 2);
+    answer(h, '{"answer":["Z"]}', 1); await flush();
+    assert.match(h.q().status, /第 2 次/);
+    await h.advance(500);
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 3);
+    answer(h, '{"answer":["A"],"explanation":"修正"}', 2); await flush();
+    assert.equal(h.posts.length, 1); assert.deepEqual(Array.from(h.posts[0].body.result), ['A']);
+    await h.advance(30000); assert.equal(h.posts.length, 1);
+});
+test('AI format failures continue until the timeout fallback submits once', async () => {
+    const h = harness(); enable(h, { mode: 'ai-auto', timeout: 3 }); h.capture(); h.unlock();
+    await flush(); answer(h, '{"answer":["Z"]}'); await flush();
+    assert.equal(h.posts.length, 0);
+    await h.advance(3000);
+    assert.equal(h.posts.length, 1); assert.match(h.q().status, /格式无效.*随机兜底/);
+});
+test('AI display retries format failures but never submits', async () => {
+    const h = harness(); enable(h, { mode: 'ai-display' }); h.capture(); h.unlock();
+    await flush(); answer(h, 'not json'); await flush();
+    assert.equal(h.posts.length, 0); assert.match(h.q().status, /格式无效/);
+    await h.advance(500); answer(h, '{"answer":["B"]}', 1); await flush();
+    assert.equal(h.q().answer.choices[0], 'B'); assert.equal(h.posts.length, 0);
+});
+test('AI transport failures are not retried as format failures', async () => {
+    const h = harness(); enable(h, { mode: 'ai-auto' }); h.capture(); h.unlock();
+    await flush(); h.requests[0].onload({ status: 429, responseText: '' }); await flush();
+    assert.equal(h.posts.length, 1); assert.match(h.q().status, /AI 失败.*随机兜底/);
 });
 test('unknown image host prevents sending a key or signed URL to any provider', async () => {
     const h = harness(); enable(h, { mode: 'ai-display', images: true }); h.capture(); h.unlock();

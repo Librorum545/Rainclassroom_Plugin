@@ -1,14 +1,14 @@
 {
   "name": "rainclassroom-plugin",
-  "version": "1.4.0",
   "private": true,
   "description": "Tampermonkey userscript for Rain Classroom courseware, recordings, and optional quiz assistance",
   "scripts": {
-    "check": "node --check main.js && node --check tests/browser-server.cjs && node --check tests/browser.test.cjs",
+    "check": "node --check main.js && node --check tests/browser-server.cjs && node --check tests/browser.test.cjs && node --check tests/ai-debug.mjs",
     "test:unit": "node --test tests/downloader.test.cjs tests/quiz.test.cjs",
     "test:browser": "node --test tests/browser.test.cjs",
     "test": "npm run check && npm run test:unit && npm run test:browser",
-    "fixture": "node tests/browser-server.cjs"
+    "fixture": "node tests/browser-server.cjs",
+    "debug:ai": "node tests/ai-debug.mjs"
   },
   "engines": {
     "node": ">=22"
