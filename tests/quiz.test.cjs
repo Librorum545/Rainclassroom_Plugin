@@ -92,7 +92,7 @@ function harness(options = {}) {
     vm.runInContext(source.replace('    init();', `window.api = {
         captureQuestionSlides, processQuizSocket, receiveQuizEvent, setupQuizBridge, setupFrameListener,
         setupFrameRelay, setupQuizSocket, recoverQuizPage, observeAnswerRequest, quizQuestions, localQuestions,
-        applyQuizSettings, validateQuizSettings, parseAIAnswer, randomChoices, aiEndpoint, claimQuizAttempt,
+        applyQuizSettings, validateQuizSettings, parseAIAnswer, randomChoices, aiEndpoint, claimQuizAttempt, QUIZ_DEFAULTS,
         submitQuizAnswer, testAIConnection, quizKey, frameId, IS_TOP_WINDOW,
         uiLog, recordDiagnosticEvent, buildDiagnosticPackage, diagnosticEvents,
         settings: () => quizSettings, page: PAGE_WINDOW,
@@ -121,6 +121,12 @@ function answer(h, value = '{"answer":["B"],"explanation":"理由"}', index = 0)
     const request = h.requests.filter(r => r.method === 'POST')[index];
     request.onload({ status: 200, responseText: JSON.stringify({ choices: [{ message: { content: value } }] }) });
 }
+
+test('AI defaults enable question images and use a 40-second timeout', () => {
+    const h = harness();
+    assert.equal(h.QUIZ_DEFAULTS.images, true);
+    assert.equal(h.QUIZ_DEFAULTS.timeout, 40);
+});
 
 test('disabled by default: deck and live question cause neither AI requests nor submissions', async () => {
     const h = harness(); h.capture(); h.unlock(); await h.advance(60000);
