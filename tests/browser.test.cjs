@@ -399,6 +399,24 @@ test('headless browser fixture covers userscript injection and classroom flows',
         assert.equal(submission.payload.problemType, 1);
         assert.ok(['A', 'B'].includes(submission.payload.result[0]));
 
+        await cdp.evaluate(`(() => {
+            window.__rcDiagnosticBlob = null;
+            URL.createObjectURL = blob => { window.__rcDiagnosticBlob = blob; return 'blob:diagnostic-test'; };
+            HTMLAnchorElement.prototype.click = () => {};
+            document.getElementById('rc-log-export-mode').value = 'detail';
+            document.getElementById('rc-log-export').click();
+        })()`);
+        const exported = await waitFor(async () => {
+            const raw = await cdp.evaluate(`window.__rcDiagnosticBlob ? window.__rcDiagnosticBlob.text() : ''`);
+            return raw ? JSON.parse(raw) : null;
+        }, 'diagnostic JSON export');
+        assert.equal(exported.packageType, 'rain-classroom-plugin-diagnostics');
+        assert.equal(exported.mode, 'detail');
+        assert.equal(exported.script.version, scriptVersion);
+        assert.ok(exported.events.some(event => event.category === 'courseware'));
+        assert.ok(exported.events.some(event => event.event === 'submission-confirmed'));
+        assert.doesNotMatch(JSON.stringify(exported), /test-key/);
+
         assert.deepEqual(runtimeErrors, []);
         assert.deepEqual(consoleErrors, []);
         assert.deepEqual(await cdp.evaluate(`window.fixtureDiagnostics.errors`), []);

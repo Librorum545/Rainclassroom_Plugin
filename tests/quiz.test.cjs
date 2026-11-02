@@ -94,6 +94,7 @@ function harness(options = {}) {
         setupFrameRelay, setupQuizSocket, recoverQuizPage, observeAnswerRequest, quizQuestions, localQuestions,
         applyQuizSettings, validateQuizSettings, parseAIAnswer, randomChoices, aiEndpoint, claimQuizAttempt,
         submitQuizAnswer, testAIConnection, quizKey, frameId, IS_TOP_WINDOW,
+        uiLog, recordDiagnosticEvent, buildDiagnosticPackage, diagnosticEvents,
         settings: () => quizSettings, page: PAGE_WINDOW,
     };`), window);
     const api = window.api;
@@ -160,6 +161,41 @@ test('AI automatic answer submits once and cancels timeout fallback', async () =
     const h = harness(); enable(h, { mode: 'ai-auto' }); h.capture(); h.unlock();
     await flush(); answer(h); await flush(); await h.advance(21000);
     assert.equal(h.posts.length, 1); assert.deepEqual(Array.from(h.posts[0].body.result), ['B']);
+});
+test('diagnostic export separates brief and detailed logs and redacts credentials', async () => {
+    const h = harness();
+    h.uiLog('用户可见日志', 'info');
+    h.recordDiagnosticEvent('ai', 'request-start', '', {
+        url: 'https://example.test/chat?api_key=url-secret',
+        headers: { Authorization: 'Bearer header-secret', Cookie: 'session=secret' },
+        body: { messages: [{ role: 'user', content: '完整题干与选项' }] },
+    });
+    const now = new Date(h.now());
+    const brief = h.buildDiagnosticPackage('brief', now);
+    const detail = h.buildDiagnosticPackage('detail', now);
+    assert.ok(brief.events.some(event => event.message === '用户可见日志'));
+    assert.ok(!brief.events.some(event => event.event === 'request-start'));
+    const exchange = detail.events.find(event => event.event === 'request-start' && event.details?.body);
+    assert.equal(exchange.details.headers.Authorization, '<redacted>');
+    assert.equal(exchange.details.headers.Cookie, '<redacted>');
+    assert.equal(exchange.details.body.messages[0].content, '完整题干与选项');
+    assert.doesNotMatch(exchange.details.url, /url-secret/);
+    assert.equal(detail.diagnostics.fullAiPayloadIncluded, true);
+    assert.equal(brief.diagnostics.fullAiPayloadIncluded, false);
+});
+test('detailed diagnostic export records the complete AI request and raw response', async () => {
+    const h = harness(); enable(h, { mode: 'ai-display' }); h.capture(); h.unlock();
+    await flush();
+    const rawResponse = JSON.stringify({ choices: [{ message: { content: '{"answer":["B"],"explanation":"完整响应"}' } }] });
+    h.requests[0].onload({ status: 200, responseText: rawResponse });
+    await flush();
+    const detail = h.buildDiagnosticPackage('detail', new Date(h.now()));
+    const request = detail.events.find(event => event.event === 'request-start' && event.details?.kind === 'quiz-chat');
+    const response = detail.events.find(event => event.event === 'request-complete' && event.details?.kind === 'quiz-chat');
+    assert.ok(request.details.body.messages.some(message => message.role === 'system'));
+    assert.ok(request.details.body.messages.some(message => message.role === 'user'));
+    assert.equal(request.details.headers.Authorization, '<redacted>');
+    assert.equal(response.details.responseText, rawResponse);
 });
 test('AI timeout falls back exactly once; late response cannot submit again', async () => {
     const h = harness(); enable(h, { mode: 'ai-auto', timeout: 2 }); h.capture(); h.unlock();
