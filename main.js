@@ -2,7 +2,7 @@
 // @name         Rain Classroom Courseware Plugin
 // @name:zh-CN   雨课堂课程助手
 // @namespace    https://github.com/Librorum545/Rainclassroom_Plugin
-// @version      1.5.0
+// @version      1.5.1
 // @updateURL    https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @downloadURL  https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
@@ -3248,6 +3248,7 @@
         const slides = json?.data?.slides;
         if (!Array.isArray(slides)) return;
         let captured = 0;
+        const changedQuestionIds = new Set();
         for (const slide of slides) {
             const p = slide?.problem;
             if (!p || !validQuizId(p.problemId)) continue;
@@ -3255,17 +3256,25 @@
             const options = (Array.isArray(p.options) ? p.options : []).map(o => ({
                 key: String(o.key || ''), value: String(o.value || '').slice(0, 4000),
             })).filter(o => /^[A-Z0-9]{1,8}$/.test(o.key));
-            localSlides.set(p.problemId, {
+            const nextSlide = {
                 id: p.problemId, type: Number(p.problemType), body: String(p.body || '').slice(0, 16000),
                 options, image: typeof slide.cover === 'string' ? slide.cover : '',
-                answered: p.result !== null && p.result !== undefined,
-            });
+                answered: (p.result !== null && p.result !== undefined)
+                    || localSlides.get(p.problemId)?.answered === true,
+            };
+            const previousSlide = localSlides.get(p.problemId);
+            if (!previousSlide || JSON.stringify(previousSlide) !== JSON.stringify(nextSlide)) {
+                changedQuestionIds.add(p.problemId);
+            }
+            localSlides.set(p.problemId, nextSlide);
             captured++;
         }
         while (localSlides.size > 500) localSlides.delete(localSlides.keys().next().value);
-        if (captured && IS_TOP_WINDOW) recordDiagnosticEvent('quiz', 'slide-data-captured', '',
-            { capturedCount: captured, storedSlideCount: localSlides.size });
-        for (const q of localQuestions.values()) publishLocalQuestion(q);
+        if (changedQuestionIds.size && IS_TOP_WINDOW) recordDiagnosticEvent('quiz', 'slide-data-captured', '',
+            { capturedCount: captured, changedCount: changedQuestionIds.size, storedSlideCount: localSlides.size });
+        for (const q of localQuestions.values()) {
+            if (changedQuestionIds.has(q.id)) publishLocalQuestion(q);
+        }
     }
 
     function publishLocalQuestion(q) {
@@ -3742,6 +3751,10 @@
         };
         const key = quizKey(incoming.lesson, incoming.id);
         let q = quizQuestions.get(key);
+        const previousState = q ? JSON.stringify({
+            status: q.status, attempted: q.attempted, answered: q.answered,
+            closed: q.closed, deadline: q.deadline, choices: q.answer?.choices || null,
+        }) : '';
         if (q) {
             Object.assign(q, incoming, { sourceFrame, answered: q.answered || incoming.answered });
         } else {
@@ -3763,9 +3776,15 @@
             stopQuizJob(quizQuestions.get(oldest));
             quizQuestions.delete(oldest);
         }
-        recordDiagnosticEvent('quiz', q.attempted || q.answered ? 'question-updated' : 'question-received',
-            '答题：' + (q.status || '已收到题目'), quizDiagnosticDetails(q),
-            { level: /失败|不支持|已结束/.test(q.status) ? 'warn' : 'info', userVisible: true });
+        const currentState = JSON.stringify({
+            status: q.status, attempted: q.attempted, answered: q.answered,
+            closed: q.closed, deadline: q.deadline, choices: q.answer?.choices || null,
+        });
+        if (!previousState || previousState !== currentState) {
+            recordDiagnosticEvent('quiz', q.attempted || q.answered ? 'question-updated' : 'question-received',
+                '答题：' + (q.status || '已收到题目'), quizDiagnosticDetails(q),
+                { level: /失败|不支持|已结束/.test(q.status) ? 'warn' : 'info', userVisible: true });
+        }
         renderQuizStatus();
     }
 

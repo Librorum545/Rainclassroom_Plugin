@@ -197,6 +197,19 @@ test('detailed diagnostic export records the complete AI request and raw respons
     assert.equal(request.details.headers.Authorization, '<redacted>');
     assert.equal(response.details.responseText, rawResponse);
 });
+test('repeated identical slide recovery does not duplicate status or submission logs', async () => {
+    const h = harness(); enable(h, { delay: 1 }); h.capture(); h.unlock();
+    await h.advance(1000);
+    const before = h.buildDiagnosticPackage('detail', new Date(h.now()));
+    const beforeUpdated = before.events.filter(event => event.event === 'question-updated').length;
+    const beforeSlides = before.events.filter(event => event.event === 'slide-data-captured').length;
+    for (let index = 0; index < 25; index++) h.capture();
+    const after = h.buildDiagnosticPackage('detail', new Date(h.now()));
+    assert.equal(after.events.filter(event => event.event === 'question-updated').length, beforeUpdated);
+    assert.equal(after.events.filter(event => event.event === 'slide-data-captured').length, beforeSlides);
+    assert.equal(after.events.filter(event => event.event === 'submission-confirmed').length, 1);
+    assert.equal(after.events.filter(event => event.event === 'source-submit-complete').length, 1);
+});
 test('AI timeout falls back exactly once; late response cannot submit again', async () => {
     const h = harness(); enable(h, { mode: 'ai-auto', timeout: 2 }); h.capture(); h.unlock();
     await flush(); await h.advance(2000); answer(h); await flush();
