@@ -806,7 +806,7 @@ test('iframe direct PPT relay preserves lesson and presentation query IDs and de
     const frame = harness({ pageWindow: pages.child, managerStorage: manager });
     frame.setupFrameRelay();
     frame.processApiResponse(pptUrl('a'), pptPayload('a'));
-    await settle();
+    await waitUntil(() => top.STATE.pendingItems.length === 1, 'iframe direct PPT relay');
     assert.equal(top.STATE.pendingItems[0].captureKey, 'lesson:7:a');
     await top.handleLessonInfo({ data: { lessonId: '7', presentationIds: ['a'], lessonName: '测试课', teacherName: '教师' } });
     assert.equal(top.STATE.pendingItems.length, 1);

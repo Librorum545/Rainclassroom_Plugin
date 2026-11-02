@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { startFixtureServer } = require('./browser-server.cjs');
 
+const scriptVersion = /^\/\/\s*@version\s+(\S+)\s*$/m.exec(fs.readFileSync(require.resolve('../main.js'), 'utf8'))?.[1];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function findBrowser() {
@@ -282,7 +283,9 @@ test('headless browser fixture covers userscript injection and classroom flows',
             return counts;
         })()`);
         assert.deepEqual(panelCounts, [1, 0, 0]);
-        assert.match(await cdp.evaluate(`document.getElementById('rc-panel-header').textContent`), /雨课堂助手\s*1\.4\.0/);
+        assert.ok(scriptVersion, 'Userscript metadata must declare a version');
+        assert.equal(await cdp.evaluate(`document.getElementById('rc-script-version').textContent`), scriptVersion,
+            'Panel version must match the installed userscript metadata');
 
         await clickInFrame(cdp, 0, 'login');
         await waitFor(() => cdp.evaluate(`document.getElementById('rc-panel-container').style.display === 'none'`), 'QR overlay to hide panel');

@@ -2,7 +2,9 @@
 // @name         Rain Classroom Courseware Plugin
 // @name:zh-CN   雨课堂课程助手
 // @namespace    https://github.com/Librorum545/Rainclassroom_Plugin
-// @version      1.4.2
+// @version      1.4.3
+// @updateURL    https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
+// @downloadURL  https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
 // @description:zh-CN 雨课堂课件与录播下载，可选答题辅助
 // @author       Librorum
@@ -2293,7 +2295,7 @@
         const panelHTML = `
         <div id="rc-panel-container">
             <div id="rc-panel-header">
-                <span>雨课堂助手 <small>1.4.0</small></span>
+                <span>雨课堂助手 <small id="rc-script-version"></small></span>
                 <div>
                     <button id="rc-btn-minimize" title="最小化 / 展开">_</button>
                     <button id="rc-btn-close" title="关闭面板（任务继续）">×</button>
@@ -2379,6 +2381,7 @@
         const container = document.createElement('div');
         container.innerHTML = panelHTML;
         document.body.appendChild(container.firstElementChild);
+        document.getElementById('rc-script-version').textContent = typeof GM_info !== 'undefined' ? GM_info.script?.version || '' : '';
         document.getElementById('rc-capture-status').textContent = '课件采集：' + coursewareStatus;
         for (const entry of earlyLogs.splice(0)) uiLog(entry.msg, entry.type);
 

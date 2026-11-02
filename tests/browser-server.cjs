@@ -17,11 +17,13 @@ function createFixtureServer() {
             // Unlike a plain <script>, userscript `window` is not necessarily the
             // page WindowProxy, and changing sandbox.fetch need not affect the page.
             const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+            const version = /^\/\/\s*@version\s+(\S+)\s*$/m.exec(source)?.[1];
             res.end(`(() => {
                 const sandbox = { top: window.top, fetch: async () => { throw new Error('Sandbox fetch must not be used'); },
                     addEventListener: window.addEventListener.bind(window), jspdf: window.jspdf };
                 sandbox.window = sandbox.self = sandbox;
-                new Function('window', 'unsafeWindow', ${JSON.stringify(source)})(sandbox, window);
+                const scriptInfo = { ...window.GM_info, script: { version: ${JSON.stringify(version)} } };
+                new Function('window', 'unsafeWindow', 'GM_info', ${JSON.stringify(source)})(sandbox, window, scriptInfo);
             })();`);
             return;
         }
