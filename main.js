@@ -2,7 +2,7 @@
 // @name         Rain Classroom Courseware Plugin
 // @name:zh-CN   雨课堂课程助手
 // @namespace    https://github.com/Librorum545/Rainclassroom_Plugin
-// @version      1.5.2
+// @version      1.6.0
 // @updateURL    https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @downloadURL  https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
@@ -70,8 +70,15 @@
         MAX_VIDEO_BYTES: 4 * 1024 * 1024 * 1024,
         MAX_API_BYTES: 16 * 1024 * 1024,
         MAX_AI_RESPONSE_BYTES: 2 * 1024 * 1024,
-        MAX_DIAGNOSTIC_EVENTS: 1200,
-        MAX_DIAGNOSTIC_BYTES: 40 * 1024 * 1024,
+        MAX_DIAGNOSTIC_EVENTS: 2000,
+        MAX_DIAGNOSTIC_BYTES: 8 * 1024 * 1024,
+        MAX_DIAGNOSTIC_SESSION_BYTES: 32 * 1024 * 1024,
+        MAX_DIAGNOSTIC_TOTAL_BYTES: 100 * 1024 * 1024,
+        DIAGNOSTIC_RETENTION_MS: 7 * 24 * 60 * 60 * 1000,
+        DIAGNOSTIC_DELETE_GRACE_MS: 24 * 60 * 60 * 1000,
+        DIAGNOSTIC_SEGMENT_EVENTS: 128,
+        DIAGNOSTIC_SEGMENT_BYTES: 1024 * 1024,
+        MAX_DIAGNOSTIC_PAYLOAD_BYTES: 2 * 1024 * 1024,
         AI_RETRY_DELAY_MS: 500,       // Delay between retries after an AI format error.
         QUIZ_DEADLINE_SYNC_MS: 3000,  // Ignore countdown jitter smaller than this.
         MAX_CHANNEL_BYTES: 20 * 1024 * 1024,
@@ -2020,19 +2027,566 @@
     }
 
     // ==================== Diagnostics and UI log ====================
-    const DIAGNOSTIC_SCHEMA_VERSION = 1;
+    const DIAGNOSTIC_SCHEMA_VERSION = 2;
+    const DIAGNOSTIC_DB_NAME = 'rc_diagnostics_v2';
+    const DIAGNOSTIC_DB_VERSION = 1;
+    const DIAGNOSTIC_SESSION_KEY = 'rc_diagnostic_session_v2';
+    const DIAGNOSTIC_LAST_CLEAR_KEY = 'rc_diagnostic_last_clear_v2';
     const diagnosticEvents = [];
-    const diagnosticSession = { id: createItemId(), startedAt: Date.now() };
+    const diagnosticPendingEvents = [];
+    let diagnosticSession = diagnosticSessionIdentity();
     let diagnosticEventSerial = 0;
     let diagnosticBytes = 0;
     let diagnosticDropped = 0;
     let diagnosticExporting = false;
+    let diagnosticDbPromise = null;
+    let diagnosticDbAvailable = Boolean(IS_TOP_WINDOW && PAGE_WINDOW.indexedDB);
+    let diagnosticStorageReady = null;
+    let diagnosticPersistenceQueue = Promise.resolve();
+    let diagnosticFlushTimer = null;
+    let diagnosticSessionBytes = 0;
+    let diagnosticStoredEventCount = 0;
+    let diagnosticSessionsCache = [];
+    let diagnosticEvictions = [];
+    let diagnosticEvictedEventCount = 0;
     const earlyLogs = [];
     let coursewareStatus = '等待课程或课件接口响应…';
 
     function diagnosticByteLength(value) {
         try { return new TextEncoder().encode(JSON.stringify(value)).byteLength; }
         catch (err) { return 0; }
+    }
+
+    function diagnosticSessionIdentity() {
+        const now = Date.now();
+        try {
+            const stored = JSON.parse(sessionStorage.getItem(DIAGNOSTIC_SESSION_KEY) || 'null');
+            if (stored && typeof stored.id === 'string' && stored.id.length <= 100
+                && Number.isFinite(stored.startedAt) && stored.startedAt <= now + 60000) {
+                return { id: stored.id, startedAt: stored.startedAt };
+            }
+        } catch (err) {}
+        const identity = { id: createItemId(), startedAt: now };
+        try { sessionStorage.setItem(DIAGNOSTIC_SESSION_KEY, JSON.stringify(identity)); } catch (err) {}
+        return identity;
+    }
+
+    function replaceDiagnosticSessionIdentity() {
+        diagnosticSession = { id: createItemId(), startedAt: Date.now() };
+        try { sessionStorage.setItem(DIAGNOSTIC_SESSION_KEY, JSON.stringify(diagnosticSession)); } catch (err) {}
+        diagnosticEventSerial = 0;
+        diagnosticSessionBytes = 0;
+        diagnosticStoredEventCount = 0;
+        diagnosticEvictions = [];
+        diagnosticEvictedEventCount = 0;
+    }
+
+    function diagnosticRequest(request) {
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+        });
+    }
+
+    function diagnosticTransactionComplete(transaction) {
+        return new Promise((resolve, reject) => {
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || new Error('IndexedDB transaction failed'));
+            transaction.onabort = () => reject(transaction.error || new Error('IndexedDB transaction aborted'));
+        });
+    }
+
+    function openDiagnosticDatabase() {
+        if (!diagnosticDbAvailable || !IS_TOP_WINDOW) return Promise.resolve(null);
+        if (diagnosticDbPromise) return diagnosticDbPromise;
+        diagnosticDbPromise = new Promise((resolve, reject) => {
+            const request = PAGE_WINDOW.indexedDB.open(DIAGNOSTIC_DB_NAME, DIAGNOSTIC_DB_VERSION);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'id' });
+                if (!db.objectStoreNames.contains('segments')) {
+                    const store = db.createObjectStore('segments', { keyPath: 'id' });
+                    store.createIndex('sessionId', 'sessionId', { unique: false });
+                }
+                if (!db.objectStoreNames.contains('payloads')) {
+                    const store = db.createObjectStore('payloads', { keyPath: 'id' });
+                    store.createIndex('sessionId', 'sessionId', { unique: false });
+                }
+            };
+            request.onsuccess = () => {
+                const db = request.result;
+                db.onversionchange = () => db.close();
+                resolve(db);
+            };
+            request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+            request.onblocked = () => reject(new Error('IndexedDB upgrade blocked by another tab'));
+        }).catch(err => {
+            diagnosticDbAvailable = false;
+            console.warn('[Rainclassroom] Diagnostic persistence unavailable:', err);
+            return null;
+        });
+        return diagnosticDbPromise;
+    }
+
+    async function diagnosticGetAll(storeName, indexName = '', key = undefined) {
+        const db = await openDiagnosticDatabase();
+        if (!db) return [];
+        const store = db.transaction(storeName, 'readonly').objectStore(storeName);
+        const source = indexName ? store.index(indexName) : store;
+        return diagnosticRequest(key === undefined ? source.getAll() : source.getAll(key));
+    }
+
+    async function diagnosticDigest(text) {
+        const subtle = PAGE_WINDOW.crypto?.subtle || (typeof crypto !== 'undefined' ? crypto.subtle : null);
+        if (!subtle) return null;
+        try {
+            const digest = await subtle.digest('SHA-256', new TextEncoder().encode(text));
+            return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+        } catch (err) { return null; }
+    }
+
+    async function compressDiagnosticText(text) {
+        const bytes = new TextEncoder().encode(text).byteLength;
+        const CompressionStreamCtor = PAGE_WINDOW.CompressionStream;
+        const ResponseCtor = PAGE_WINDOW.Response || (typeof Response === 'function' ? Response : null);
+        if (!CompressionStreamCtor || !ResponseCtor) return { data: text, compression: 'none', bytes };
+        try {
+            const stream = new Blob([text]).stream().pipeThrough(new CompressionStreamCtor('gzip'));
+            const compressed = await new ResponseCtor(stream).blob();
+            return { data: compressed, compression: 'gzip', bytes, storedBytes: compressed.size };
+        } catch (err) {
+            return { data: text, compression: 'none', bytes };
+        }
+    }
+
+    async function prepareDiagnosticPayload(sessionId, text, context) {
+        const digest = await diagnosticDigest(text);
+        if (digest && context.payloadByDigest.has(digest)) return context.payloadByDigest.get(digest);
+        const packed = await compressDiagnosticText(text);
+        const id = sessionId + ':' + (digest || String(Date.now()) + '-' + context.payloads.length);
+        const dataURL = /^data:([^;,]+)[;,]/.exec(text);
+        const record = {
+            id, sessionId, digest: digest || '', type: dataURL ? 'data-url' : 'text',
+            mimeType: dataURL ? dataURL[1].slice(0, 200) : '', bytes: packed.bytes,
+            storedBytes: Number(packed.storedBytes) || packed.bytes,
+            compression: packed.compression, data: packed.data, createdAt: Date.now(),
+        };
+        context.payloads.push(record);
+        if (digest) context.payloadByDigest.set(digest, record);
+        return {
+            $diagnosticPayload: true, id, digest: digest || '', type: record.type,
+            mimeType: record.mimeType, bytes: record.bytes,
+            storedBytes: record.storedBytes, compression: record.compression,
+        };
+    }
+
+    async function extractDiagnosticPayloads(value, sessionId, context, depth = 0) {
+        if (typeof value === 'string') {
+            if (diagnosticByteLength(value) >= CONFIG.MAX_DIAGNOSTIC_PAYLOAD_BYTES) {
+                return prepareDiagnosticPayload(sessionId, value, context);
+            }
+            return value;
+        }
+        if (value === null || value === undefined || typeof value !== 'object' || depth >= 12) return value;
+        if (Array.isArray(value)) {
+            const result = [];
+            for (const item of value) result.push(await extractDiagnosticPayloads(item, sessionId, context, depth + 1));
+            return result;
+        }
+        const result = {};
+        for (const [key, child] of Object.entries(value).slice(0, 200)) {
+            result[key] = await extractDiagnosticPayloads(child, sessionId, context, depth + 1);
+        }
+        return result;
+    }
+
+    async function hydrateDiagnosticPayloads(value, payloadCache, depth = 0) {
+        if (!value || typeof value !== 'object') return value;
+        if (value.$diagnosticPayload === true && typeof value.id === 'string') {
+            let record = payloadCache.get(value.id);
+            if (!record) {
+                const db = await openDiagnosticDatabase();
+                if (!db) return '<payload-unavailable>';
+                record = await diagnosticRequest(db.transaction('payloads', 'readonly').objectStore('payloads').get(value.id));
+                if (record) payloadCache.set(value.id, record);
+            }
+            if (!record) return '<payload-unavailable>';
+            if (record.compression === 'gzip' && record.data instanceof Blob) {
+                const DecompressionStreamCtor = PAGE_WINDOW.DecompressionStream;
+                const ResponseCtor = PAGE_WINDOW.Response || (typeof Response === 'function' ? Response : null);
+                if (DecompressionStreamCtor && ResponseCtor) {
+                    try {
+                        return await new ResponseCtor(record.data.stream().pipeThrough(new DecompressionStreamCtor('gzip'))).text();
+                    } catch (err) { return '<payload-decompression-failed>'; }
+                }
+            }
+            return typeof record.data === 'string' ? record.data : '<payload-unavailable>';
+        }
+        if (depth >= 12) return '<max-depth>';
+        if (Array.isArray(value)) {
+            const result = [];
+            for (const item of value) result.push(await hydrateDiagnosticPayloads(item, payloadCache, depth + 1));
+            return result;
+        }
+        const result = {};
+        for (const [key, child] of Object.entries(value).slice(0, 200)) {
+            result[key] = await hydrateDiagnosticPayloads(child, payloadCache, depth + 1);
+        }
+        return result;
+    }
+
+    function diagnosticSessionValue(session) {
+        return Number(session.storageBytes) || 0;
+    }
+
+    async function refreshDiagnosticStorageStats() {
+        if (!diagnosticDbAvailable) return;
+        const sessions = await diagnosticGetAll('sessions');
+        diagnosticSessionsCache = sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        const current = diagnosticSessionsCache.find(session => session.id === diagnosticSession.id);
+        diagnosticSessionBytes = diagnosticSessionValue(current || {});
+        diagnosticStoredEventCount = Number(current?.eventCount) || 0;
+        diagnosticEvictions = Array.isArray(current?.evictions) ? current.evictions.slice(-20) : [];
+        diagnosticEvictedEventCount = Number(current?.evictedEventCount) || 0;
+        if (document.getElementById('rc-log-manager')) renderDiagnosticManager();
+    }
+
+    async function purgeDiagnosticSession(sessionId) {
+        const db = await openDiagnosticDatabase();
+        if (!db) return;
+        const segments = await diagnosticGetAll('segments', 'sessionId', sessionId);
+        const payloads = await diagnosticGetAll('payloads', 'sessionId', sessionId);
+        const transaction = db.transaction(['sessions', 'segments', 'payloads'], 'readwrite');
+        for (const record of segments) transaction.objectStore('segments').delete(record.id);
+        for (const record of payloads) transaction.objectStore('payloads').delete(record.id);
+        transaction.objectStore('sessions').delete(sessionId);
+        await diagnosticTransactionComplete(transaction);
+    }
+
+    async function removeDiagnosticSegment(session, segment) {
+        const db = await openDiagnosticDatabase();
+        if (!db) return;
+        const remaining = (await diagnosticGetAll('segments', 'sessionId', session.id))
+            .filter(record => record.id !== segment.id);
+        const referenced = new Set(remaining.flatMap(record => record.payloadIds || []));
+        const payloads = await diagnosticGetAll('payloads', 'sessionId', session.id);
+        const removedPayloads = payloads.filter(payload => !referenced.has(payload.id));
+        const transaction = db.transaction(['sessions', 'segments', 'payloads'], 'readwrite');
+        transaction.objectStore('segments').delete(segment.id);
+        for (const payload of removedPayloads) transaction.objectStore('payloads').delete(payload.id);
+        const eviction = {
+            at: new Date().toISOString(), segmentId: segment.id,
+            seqStart: segment.seqStart, seqEnd: segment.seqEnd,
+            eventCount: segment.eventCount, bytes: segment.bytes, reason: 'session-size-limit',
+        };
+        const removedPayloadBytes = removedPayloads.reduce(
+            (sum, payload) => sum + (Number(payload.storedBytes) || Number(payload.bytes) || 0), 0);
+        session.storageBytes = Math.max(0, (Number(session.storageBytes) || 0)
+            - (Number(segment.bytes) || 0) - removedPayloadBytes);
+        session.segmentCount = Math.max(0, (Number(session.segmentCount) || 1) - 1);
+        session.evictedEventCount = (Number(session.evictedEventCount) || 0) + segment.eventCount;
+        session.evictions = [...(session.evictions || []).slice(-19), eviction];
+        session.updatedAt = Date.now();
+        transaction.objectStore('sessions').put(session);
+        await diagnosticTransactionComplete(transaction);
+    }
+
+    function diagnosticCoalescingKey(event) {
+        if (!event || !['debug', 'info', 'success'].includes(event.level) || event.userVisible) return '';
+        let details;
+        try { details = JSON.stringify(event.details); } catch (err) { return ''; }
+        if (details && details.length > 10000) return '';
+        return [event.category || '', event.event || '', event.level || '',
+            String(event.message || ''), details || ''].join('\u0000');
+    }
+
+    async function compactDiagnosticSegmentDuplicates(sessionId) {
+        const db = await openDiagnosticDatabase();
+        if (!db) return false;
+        const segments = (await diagnosticGetAll('segments', 'sessionId', sessionId))
+            .sort((a, b) => a.seqStart - b.seqStart);
+        if (!segments.length) return false;
+        const session = await diagnosticRequest(
+            db.transaction('sessions', 'readonly').objectStore('sessions').get(sessionId));
+        if (!session) return false;
+
+        const updates = [];
+        let removedEventCount = 0;
+        let removedBytes = 0;
+        for (const segment of segments.slice(0, -2)) {
+            const events = [];
+            const lastByKey = new Map();
+            for (const event of segment.events || []) {
+                const key = diagnosticCoalescingKey(event);
+                const previous = key ? lastByKey.get(key) : null;
+                const currentTime = Date.parse(event.time);
+                const previousTime = previous ? Date.parse(previous.time) : NaN;
+                if (previous && Number.isFinite(currentTime) && Number.isFinite(previousTime)
+                    && Math.abs(currentTime - previousTime) <= 30000) {
+                    const oldCount = Number(previous.diagnosticCoalesced?.count) || 1;
+                    previous.diagnosticCoalesced = {
+                        count: oldCount + 1,
+                        firstTime: previous.diagnosticCoalesced?.firstTime || previous.time,
+                        lastTime: event.time,
+                    };
+                    removedEventCount++;
+                    continue;
+                }
+                events.push(event);
+                if (key) lastByKey.set(key, event);
+            }
+            if (events.length === (segment.events || []).length) continue;
+            const previousBytes = Number(segment.bytes) || 0;
+            const nextBytes = diagnosticByteLength(events);
+            const payloadIds = [...new Set(events.flatMap(event => collectDiagnosticPayloadIds(event)))];
+            updates.push({ ...segment, events, bytes: nextBytes, eventCount: events.length, payloadIds });
+            removedBytes += Math.max(0, previousBytes - nextBytes);
+        }
+        if (!updates.length) return false;
+
+        const transaction = db.transaction(['sessions', 'segments'], 'readwrite');
+        const segmentStore = transaction.objectStore('segments');
+        for (const segment of updates) segmentStore.put(segment);
+        session.eventCount = Math.max(0, (Number(session.eventCount) || 0) - removedEventCount);
+        session.coalescedEventCount = (Number(session.coalescedEventCount) || 0) + removedEventCount;
+        session.storageBytes = Math.max(0, (Number(session.storageBytes) || 0) - removedBytes);
+        session.updatedAt = Date.now();
+        transaction.objectStore('sessions').put(session);
+        await diagnosticTransactionComplete(transaction);
+        return true;
+    }
+
+    async function enforceDiagnosticSessionLimit(sessionId) {
+        const db = await openDiagnosticDatabase();
+        if (!db) return;
+        let session = await diagnosticRequest(db.transaction('sessions', 'readonly').objectStore('sessions').get(sessionId));
+        if (!session || diagnosticSessionValue(session) <= CONFIG.MAX_DIAGNOSTIC_SESSION_BYTES) return;
+        if (await compactDiagnosticSegmentDuplicates(sessionId)) {
+            session = await diagnosticRequest(
+                db.transaction('sessions', 'readonly').objectStore('sessions').get(sessionId));
+            if (!session || diagnosticSessionValue(session) <= CONFIG.MAX_DIAGNOSTIC_SESSION_BYTES) return;
+        }
+        let segments = (await diagnosticGetAll('segments', 'sessionId', sessionId))
+            .sort((a, b) => a.seqStart - b.seqStart);
+        while (diagnosticSessionValue(session) > CONFIG.MAX_DIAGNOSTIC_SESSION_BYTES && segments.length > 1) {
+            const candidates = segments.slice(0, -1).map(segment => {
+                const events = segment.events || [];
+                const errors = events.filter(event => event.level === 'error').length;
+                const warnings = events.filter(event => event.level === 'warn').length;
+                const visible = events.filter(event => event.userVisible).length;
+                return { segment, score: errors * 100 + warnings * 20 + visible * 10 + events.length };
+            }).sort((a, b) => a.score - b.score || a.segment.seqStart - b.segment.seqStart);
+            const victim = candidates[0]?.segment;
+            if (!victim) break;
+            await removeDiagnosticSegment(session, victim);
+            segments = segments.filter(segment => segment.id !== victim.id);
+        }
+    }
+
+    async function cleanupDiagnosticDatabase() {
+        if (!diagnosticDbAvailable) return;
+        const now = Date.now();
+        let sessions = await diagnosticGetAll('sessions');
+        for (const session of sessions) {
+            if (session.id === diagnosticSession.id) continue;
+            const shouldPurge = session.deletedAt
+                ? now - session.deletedAt > CONFIG.DIAGNOSTIC_DELETE_GRACE_MS
+                : now - (session.updatedAt || session.startedAt || 0) > CONFIG.DIAGNOSTIC_RETENTION_MS;
+            if (shouldPurge) await purgeDiagnosticSession(session.id);
+        }
+        sessions = (await diagnosticGetAll('sessions')).filter(session => session.id !== diagnosticSession.id);
+        let total = (await diagnosticGetAll('sessions')).reduce((sum, session) => sum + diagnosticSessionValue(session), 0);
+        for (const session of sessions.sort((a, b) =>
+            (a.deletedAt || a.updatedAt || 0) - (b.deletedAt || b.updatedAt || 0))) {
+            if (total <= CONFIG.MAX_DIAGNOSTIC_TOTAL_BYTES) break;
+            await purgeDiagnosticSession(session.id);
+            total -= diagnosticSessionValue(session);
+        }
+        await refreshDiagnosticStorageStats();
+    }
+
+    async function initializeDiagnosticStorage() {
+        if (!IS_TOP_WINDOW || !diagnosticDbAvailable) {
+            diagnosticDbAvailable = false;
+            return false;
+        }
+        if (diagnosticStorageReady) return diagnosticStorageReady;
+        diagnosticStorageReady = (async () => {
+            const db = await openDiagnosticDatabase();
+            if (!db) return false;
+            const now = Date.now();
+            let session;
+            try {
+                session = await diagnosticRequest(db.transaction('sessions', 'readonly').objectStore('sessions').get(diagnosticSession.id));
+                const transaction = db.transaction('sessions', 'readwrite');
+                if (!session) {
+                    session = {
+                        id: diagnosticSession.id, startedAt: diagnosticSession.startedAt, updatedAt: now,
+                        scriptVersion: diagnosticScriptInfo().version, eventCount: 0, segmentCount: 0,
+                        storageBytes: 0, evictedEventCount: 0, evictions: [], deletedAt: null,
+                    };
+                } else {
+                    session.updatedAt = now;
+                    session.scriptVersion = diagnosticScriptInfo().version;
+                }
+                transaction.objectStore('sessions').put(session);
+                await diagnosticTransactionComplete(transaction);
+            } catch (err) {
+                diagnosticDbAvailable = false;
+                console.warn('[Rainclassroom] Diagnostic session initialization failed:', err);
+                return false;
+            }
+            const segments = (await diagnosticGetAll('segments', 'sessionId', diagnosticSession.id))
+                .sort((a, b) => a.seqStart - b.seqStart);
+            if (!diagnosticEvents.length && segments.length) {
+                const tail = segments[segments.length - 1].events || [];
+                for (const event of tail) {
+                    const size = diagnosticByteLength(event);
+                    diagnosticEvents.push({ event, size });
+                    diagnosticBytes += size;
+                    diagnosticEventSerial = Math.max(diagnosticEventSerial, Number(event.seq) || 0);
+                }
+            }
+            await cleanupDiagnosticDatabase();
+            await refreshDiagnosticStorageStats();
+            return true;
+        })().catch(err => {
+            diagnosticDbAvailable = false;
+            console.warn('[Rainclassroom] Diagnostic storage initialization failed:', err);
+            return false;
+        });
+        return diagnosticStorageReady;
+    }
+
+    function collectDiagnosticPayloadIds(value, result = []) {
+        if (!value || typeof value !== 'object') return result;
+        if (value.$diagnosticPayload === true && typeof value.id === 'string') {
+            result.push(value.id);
+            return result;
+        }
+        for (const child of Object.values(value)) collectDiagnosticPayloadIds(child, result);
+        return result;
+    }
+
+    async function persistDiagnosticEvents(entries) {
+        const db = await openDiagnosticDatabase();
+        if (!db || !entries.length) return false;
+        const context = { payloads: [], payloadByDigest: new Map() };
+        const prepared = [];
+        for (const entry of entries) {
+            const event = JSON.parse(JSON.stringify(entry.event));
+            if (event.details !== undefined) {
+                event.details = await extractDiagnosticPayloads(event.details, diagnosticSession.id, context);
+            }
+            prepared.push({ event, size: diagnosticByteLength(event) });
+        }
+        const existingPayloads = new Set((await diagnosticGetAll('payloads', 'sessionId', diagnosticSession.id)).map(record => record.id));
+        const newPayloads = context.payloads.filter(record => !existingPayloads.has(record.id));
+        const payloadBytes = newPayloads.reduce((sum, record) => sum + record.storedBytes, 0);
+        const existingSegments = (await diagnosticGetAll('segments', 'sessionId', diagnosticSession.id))
+            .sort((a, b) => a.seqStart - b.seqStart);
+        let activeSegment = existingSegments.at(-1)?.sealed === false ? existingSegments.at(-1) : null;
+        if (activeSegment) activeSegment = { ...activeSegment, events: [...(activeSegment.events || [])],
+            payloadIds: [...(activeSegment.payloadIds || [])] };
+        const segmentWrites = new Map();
+        let segmentBytesAdded = 0;
+        let newSegmentCount = 0;
+        const session = await diagnosticRequest(
+            db.transaction('sessions', 'readonly').objectStore('sessions').get(diagnosticSession.id))
+            || { id: diagnosticSession.id, startedAt: diagnosticSession.startedAt, deletedAt: null, evictions: [] };
+        for (const entry of prepared) {
+            const full = activeSegment
+                && (activeSegment.eventCount >= CONFIG.DIAGNOSTIC_SEGMENT_EVENTS
+                    || activeSegment.bytes + entry.size > CONFIG.DIAGNOSTIC_SEGMENT_BYTES);
+            if (full || !activeSegment) {
+                if (activeSegment) {
+                    activeSegment.sealed = true;
+                    segmentWrites.set(activeSegment.id, activeSegment);
+                }
+                activeSegment = {
+                    id: createItemId(), sessionId: diagnosticSession.id,
+                    seqStart: Number(entry.event.seq) || 0, seqEnd: Number(entry.event.seq) || 0,
+                    createdAt: Date.now(), updatedAt: Date.now(), eventCount: 0, bytes: 0,
+                    events: [], payloadIds: [], sealed: false,
+                };
+                newSegmentCount++;
+            }
+            const oldBytes = activeSegment.bytes;
+            activeSegment.events.push(entry.event);
+            activeSegment.eventCount += 1;
+            activeSegment.seqStart = Math.min(activeSegment.seqStart, Number(entry.event.seq) || activeSegment.seqStart);
+            activeSegment.seqEnd = Math.max(activeSegment.seqEnd, Number(entry.event.seq) || activeSegment.seqEnd);
+            activeSegment.payloadIds = [...new Set([
+                ...activeSegment.payloadIds, ...collectDiagnosticPayloadIds(entry.event),
+            ])];
+            activeSegment.bytes = diagnosticByteLength(activeSegment.events);
+            activeSegment.updatedAt = Date.now();
+            if (activeSegment.eventCount >= CONFIG.DIAGNOSTIC_SEGMENT_EVENTS
+                || activeSegment.bytes >= CONFIG.DIAGNOSTIC_SEGMENT_BYTES) activeSegment.sealed = true;
+            segmentWrites.set(activeSegment.id, activeSegment);
+            segmentBytesAdded += activeSegment.bytes - oldBytes;
+        }
+        const transaction = db.transaction(['sessions', 'segments', 'payloads'], 'readwrite');
+        for (const payload of newPayloads) transaction.objectStore('payloads').put(payload);
+        const segmentStore = transaction.objectStore('segments');
+        for (const segment of segmentWrites.values()) segmentStore.put(segment);
+        session.eventCount = (Number(session.eventCount) || 0) + prepared.length;
+        session.segmentCount = (Number(session.segmentCount) || 0) + newSegmentCount;
+        session.storageBytes = (Number(session.storageBytes) || 0) + segmentBytesAdded + payloadBytes;
+        session.updatedAt = Date.now();
+        session.deletedAt = null;
+        session.scriptVersion = diagnosticScriptInfo().version;
+        transaction.objectStore('sessions').put(session);
+        await diagnosticTransactionComplete(transaction);
+        await enforceDiagnosticSessionLimit(diagnosticSession.id);
+        await refreshDiagnosticStorageStats();
+        return true;
+    }
+
+    function scheduleDiagnosticFlush() {
+        if (!diagnosticDbAvailable || diagnosticFlushTimer !== null) return;
+        diagnosticFlushTimer = setTimeout(() => {
+            diagnosticFlushTimer = null;
+            flushDiagnosticEvents().catch(() => {});
+        }, 500);
+    }
+
+    function flushDiagnosticEvents() {
+        if (diagnosticFlushTimer !== null) {
+            clearTimeout(diagnosticFlushTimer);
+            diagnosticFlushTimer = null;
+        }
+        diagnosticPersistenceQueue = diagnosticPersistenceQueue.then(async () => {
+            if (!diagnosticPendingEvents.length) return true;
+            await initializeDiagnosticStorage();
+            if (!diagnosticDbAvailable) return false;
+            const batch = diagnosticPendingEvents.splice(0);
+            try { return await persistDiagnosticEvents(batch); }
+            catch (err) {
+                diagnosticDbAvailable = false;
+                console.warn('[Rainclassroom] Diagnostic persistence failed:', err);
+                return false;
+            }
+        });
+        return diagnosticPersistenceQueue;
+    }
+
+    async function loadDiagnosticSessionEvents(sessionId, options = {}) {
+        if (!diagnosticDbAvailable) return diagnosticEvents.map(entry => entry.event);
+        await flushDiagnosticEvents();
+        const segments = (await diagnosticGetAll('segments', 'sessionId', sessionId))
+            .sort((a, b) => a.seqStart - b.seqStart);
+        const payloadCache = new Map();
+        const events = [];
+        const hydratePayloads = options.hydratePayloads !== false;
+        for (const segment of segments) {
+            for (const event of segment.events || []) {
+                events.push(hydratePayloads
+                    ? await hydrateDiagnosticPayloads(event, payloadCache)
+                    : event);
+            }
+        }
+        return events;
     }
 
     function sanitizeDiagnosticURL(value) {
@@ -2103,12 +2657,14 @@
         const size = diagnosticByteLength(event);
         diagnosticEvents.push({ event, size });
         diagnosticBytes += size;
+        diagnosticPendingEvents.push({ event, size });
         while (diagnosticEvents.length > CONFIG.MAX_DIAGNOSTIC_EVENTS
             || (diagnosticBytes > CONFIG.MAX_DIAGNOSTIC_BYTES && diagnosticEvents.length > 1)) {
             const removed = diagnosticEvents.shift();
             diagnosticBytes -= removed.size;
             diagnosticDropped++;
         }
+        scheduleDiagnosticFlush();
         return event;
     }
 
@@ -2249,6 +2805,9 @@
                 aiTimeoutSeconds: Number(quizSettings.timeout),
                 diagnosticEvents: CONFIG.MAX_DIAGNOSTIC_EVENTS,
                 diagnosticBytes: CONFIG.MAX_DIAGNOSTIC_BYTES,
+                diagnosticSessionBytes: CONFIG.MAX_DIAGNOSTIC_SESSION_BYTES,
+                diagnosticTotalBytes: CONFIG.MAX_DIAGNOSTIC_TOTAL_BYTES,
+                diagnosticRetentionDays: CONFIG.DIAGNOSTIC_RETENTION_MS / 86400000,
             },
         };
     }
@@ -2312,10 +2871,11 @@
         };
     }
 
-    function buildDiagnosticPackage(mode = 'brief', now = new Date()) {
+    function buildDiagnosticPackage(mode = 'brief', now = new Date(), sourceEvents = undefined, options = {}) {
         mode = mode === 'detail' ? 'detail' : 'brief';
-        const selected = diagnosticEvents.filter(entry => mode === 'detail' || entry.event.userVisible);
-        const events = selected.map(({ event }) => {
+        const allEvents = Array.isArray(sourceEvents) ? sourceEvents : diagnosticEvents.map(entry => entry.event);
+        const selected = allEvents.filter(event => mode === 'detail' || event.userVisible);
+        const events = selected.map(event => {
             if (mode === 'detail') return event;
             return {
                 time: event.time, elapsedMs: event.elapsedMs, level: event.level,
@@ -2336,9 +2896,10 @@
             mode,
             generatedAt: now.toISOString(),
             session: {
-                id: diagnosticSession.id,
-                startedAt: new Date(diagnosticSession.startedAt).toISOString(),
-                durationMs: Math.max(0, Date.now() - diagnosticSession.startedAt),
+                id: String(options.sessionId || diagnosticSession.id),
+                startedAt: new Date(options.startedAt || diagnosticSession.startedAt).toISOString(),
+                durationMs: Math.max(0, now.getTime() - (options.startedAt || diagnosticSession.startedAt)),
+                endedAt: options.endedAt ? new Date(options.endedAt).toISOString() : undefined,
             },
             script: diagnosticScriptInfo(),
             environment: diagnosticEnvironment(),
@@ -2354,13 +2915,19 @@
                 } : null,
             },
             diagnostics: {
-                storedEventCount: diagnosticEvents.length,
+                storedEventCount: allEvents.length,
                 exportedEventCount: events.length,
-                briefVisibleEventCount: diagnosticEvents.filter(entry => entry.event.userVisible).length,
-                droppedEventCount: diagnosticDropped,
+                briefVisibleEventCount: allEvents.filter(event => event.userVisible).length,
+                hotBufferEventCount: diagnosticEvents.length,
+                hotBufferDroppedEventCount: diagnosticDropped,
+                persistentEventCount: Number(options.persistentEventCount) || 0,
+                persistentStorageBytes: Number(options.storageBytes) || 0,
                 bufferedBytes: diagnosticBytes,
-                bufferLimited: diagnosticDropped > 0,
-                captureStartsAtPageLoad: true,
+                bufferLimited: diagnosticDropped > 0 || Number(options.evictedEventCount) > 0,
+                evictedEventCount: Number(options.evictedEventCount) || 0,
+                evictions: Array.isArray(options.evictions) ? options.evictions : [],
+                persistentStorage: diagnosticDbAvailable === true,
+                captureContinuesAcrossReloads: diagnosticDbAvailable === true,
                 fullAiPayloadIncluded: mode === 'detail',
                 secretsRedacted: true,
             },
@@ -2374,7 +2941,20 @@
         return `rainclassroom-log-${stamp}-${mode === 'detail' ? 'detail' : 'brief'}.json`;
     }
 
-    function exportDiagnosticLog(mode = 'brief') {
+    function diagnosticPackageBlob(diagnosticPackage) {
+        const metadata = { ...diagnosticPackage };
+        delete metadata.events;
+        const head = JSON.stringify(metadata, null, 2);
+        const parts = [head.slice(0, -2), ',\n  "events": ['];
+        diagnosticPackage.events.forEach((event, index) => {
+            if (index) parts.push(',');
+            parts.push(JSON.stringify(event));
+        });
+        parts.push('\n  ]\n}');
+        return new Blob(parts, { type: 'application/json;charset=utf-8' });
+    }
+
+    async function exportDiagnosticLog(mode = 'brief', options = {}) {
         mode = mode === 'detail' ? 'detail' : 'brief';
         if (diagnosticExporting) return false;
         diagnosticExporting = true;
@@ -2382,8 +2962,22 @@
             const now = new Date();
             uiLog(mode === 'detail' ? '正在导出详细诊断日志…' : '正在导出简略诊断日志…');
             recordDiagnosticEvent('diagnostics', 'export-started', '', { mode }, { level: 'info' });
+            await flushDiagnosticEvents();
+            const sessionId = options.sessionId || diagnosticSession.id;
+            const session = diagnosticSessionsCache.find(item => item.id === sessionId) || {
+                id: diagnosticSession.id, startedAt: diagnosticSession.startedAt,
+                storageBytes: diagnosticSessionBytes, eventCount: diagnosticStoredEventCount,
+                evictedEventCount: diagnosticEvictedEventCount, evictions: diagnosticEvictions,
+            };
+            let events = await loadDiagnosticSessionEvents(sessionId, { hydratePayloads: mode === 'detail' });
+            if (!events.length && sessionId === diagnosticSession.id) events = diagnosticEvents.map(entry => entry.event);
+            const diagnosticPackage = buildDiagnosticPackage(mode, now, events, {
+                sessionId, startedAt: session.startedAt, endedAt: session.deletedAt ? session.updatedAt : undefined,
+                persistentEventCount: session.eventCount, storageBytes: session.storageBytes,
+                evictedEventCount: session.evictedEventCount, evictions: session.evictions,
+            });
             const filename = diagnosticFilename(mode, now);
-            const blob = new Blob([JSON.stringify(buildDiagnosticPackage(mode, now), null, 2)], { type: 'application/json;charset=utf-8' });
+            const blob = diagnosticPackageBlob(diagnosticPackage);
             const url = URL.createObjectURL(blob);
             const anchor = document.createElement('a');
             anchor.href = url;
@@ -2394,12 +2988,238 @@
             anchor.remove();
             setTimeout(() => URL.revokeObjectURL(url), 1000);
             uiLog('已导出' + (mode === 'detail' ? '详细' : '简略') + '诊断日志：' + filename, 'success');
+            if (options.clearAfter) await clearDiagnosticLogs({ sessionId });
             return true;
         } catch (err) {
             diagnosticErrorEvent('diagnostics', 'export-failed', err);
             uiLog('导出诊断日志失败：' + err.message, 'error');
             return false;
         } finally { diagnosticExporting = false; }
+    }
+
+    async function markDiagnosticSessionsDeleted(sessionIds) {
+        const db = await openDiagnosticDatabase();
+        if (!db || !sessionIds.length) return;
+        const sessions = (await diagnosticGetAll('sessions'))
+            .filter(session => sessionIds.includes(session.id));
+        const now = Date.now();
+        const transaction = db.transaction('sessions', 'readwrite');
+        const store = transaction.objectStore('sessions');
+        for (const session of sessions) {
+            store.put({ ...session, deletedAt: now, updatedAt: now });
+        }
+        await diagnosticTransactionComplete(transaction);
+        sharedStorageSet(DIAGNOSTIC_LAST_CLEAR_KEY, {
+            sessionIds: sessions.map(session => session.id), clearedAt: now,
+        });
+    }
+
+    async function clearDiagnosticLogs(options = {}) {
+        await flushDiagnosticEvents();
+        const current = diagnosticSession.id;
+        const sessions = (await diagnosticGetAll('sessions')).filter(session => !session.deletedAt);
+        const sessionIds = options.all
+            ? [...new Set([...sessions.map(session => session.id), current])]
+            : [options.sessionId || current];
+        await markDiagnosticSessionsDeleted(sessionIds);
+        if (sessionIds.includes(current)) {
+            diagnosticEvents.splice(0);
+            diagnosticPendingEvents.splice(0);
+            diagnosticBytes = 0;
+            diagnosticDropped = 0;
+            replaceDiagnosticSessionIdentity();
+            diagnosticStorageReady = null;
+            await initializeDiagnosticStorage();
+            const panel = document.getElementById('rc-panel-log');
+            if (panel) panel.textContent = '';
+        }
+        await refreshDiagnosticStorageStats();
+        renderDiagnosticManager();
+        return true;
+    }
+
+    async function restoreLastDiagnosticClear() {
+        const record = sharedStorageGet(DIAGNOSTIC_LAST_CLEAR_KEY, null);
+        if (!record || !Array.isArray(record.sessionIds) || !Number.isFinite(record.clearedAt)
+            || Date.now() - record.clearedAt > CONFIG.DIAGNOSTIC_DELETE_GRACE_MS) return false;
+        const db = await openDiagnosticDatabase();
+        if (!db) return false;
+        const sessions = (await diagnosticGetAll('sessions'))
+            .filter(session => record.sessionIds.includes(session.id));
+        const now = Date.now();
+        const transaction = db.transaction('sessions', 'readwrite');
+        const store = transaction.objectStore('sessions');
+        for (const session of sessions) {
+            store.put({ ...session, deletedAt: null, updatedAt: now });
+        }
+        await diagnosticTransactionComplete(transaction);
+        sharedStorageSet(DIAGNOSTIC_LAST_CLEAR_KEY, null);
+        await refreshDiagnosticStorageStats();
+        renderDiagnosticManager();
+        return true;
+    }
+
+    function formatDiagnosticBytes(value) {
+        let bytes = Math.max(0, Number(value) || 0);
+        const units = ['B', 'KiB', 'MiB', 'GiB'];
+        let unit = 0;
+        while (bytes >= 1024 && unit < units.length - 1) { bytes /= 1024; unit++; }
+        return `${bytes < 10 && unit > 0 ? bytes.toFixed(1) : Math.round(bytes)} ${units[unit]}`;
+    }
+
+    function formatDiagnosticTime(value) {
+        const date = new Date(Number(value) || value);
+        if (!Number.isFinite(date.getTime())) return '未知时间';
+        return date.toLocaleString([], {
+            month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+        });
+    }
+
+    function activeDiagnosticSessions() {
+        const sessions = new Map(diagnosticSessionsCache
+            .filter(session => session && !session.deletedAt)
+            .map(session => [session.id, session]));
+        if (!sessions.has(diagnosticSession.id)) sessions.set(diagnosticSession.id, {
+            id: diagnosticSession.id, startedAt: diagnosticSession.startedAt,
+            updatedAt: Date.now(), eventCount: diagnosticStoredEventCount,
+            storageBytes: diagnosticSessionBytes, segmentCount: 0,
+        });
+        return [...sessions.values()].sort((a, b) => {
+            if (a.id === diagnosticSession.id) return -1;
+            if (b.id === diagnosticSession.id) return 1;
+            return (b.updatedAt || b.startedAt || 0) - (a.updatedAt || a.startedAt || 0);
+        });
+    }
+
+    function setDiagnosticManagerMessage(message = '', type = '') {
+        const status = document.getElementById('rc-log-manager-status');
+        if (!status) return;
+        status.textContent = message;
+        status.dataset.level = type;
+    }
+
+    function renderDiagnosticManager() {
+        const manager = document.getElementById('rc-log-manager');
+        const select = document.getElementById('rc-log-manager-session');
+        if (!manager || !select) return;
+        const sessions = activeDiagnosticSessions();
+        const previous = select.value;
+        const selectedId = sessions.some(session => session.id === previous) ? previous : diagnosticSession.id;
+        select.replaceChildren();
+        for (const session of sessions) {
+            const option = document.createElement('option');
+            option.value = session.id;
+            const markers = session.id === diagnosticSession.id ? '当前会话' : '历史会话';
+            option.textContent = `${markers} · ${formatDiagnosticTime(session.startedAt)} · ${Number(session.eventCount) || 0} 条 · ${formatDiagnosticBytes(session.storageBytes)}`;
+            select.append(option);
+        }
+        select.value = selectedId;
+        const selected = sessions.find(session => session.id === selectedId) || sessions[0];
+        const totalBytes = sessions.reduce((sum, session) => sum + (Number(session.storageBytes) || 0), 0);
+        const totalEvents = sessions.reduce((sum, session) => sum + (Number(session.eventCount) || 0), 0);
+        const current = sessions.find(session => session.id === diagnosticSession.id);
+        const text = (id, value) => {
+            const element = document.getElementById(id);
+            if (element) element.textContent = String(value);
+        };
+        text('rc-log-manager-current-events', Number(current?.eventCount) || 0);
+        text('rc-log-manager-current-size', formatDiagnosticBytes(current?.storageBytes));
+        text('rc-log-manager-total', `${sessions.length} 个 / ${totalEvents} 条`);
+        text('rc-log-manager-total-size', formatDiagnosticBytes(totalBytes));
+        text('rc-log-manager-session-info', selected
+            ? `${formatDiagnosticTime(selected.startedAt)} 开始，${Number(selected.eventCount) || 0} 条事件，${formatDiagnosticBytes(selected.storageBytes)}；淘汰 ${Number(selected.evictedEventCount) || 0} 条，压缩合并 ${Number(selected.coalescedEventCount) || 0} 条。`
+            : '没有可用会话。');
+        const storage = document.getElementById('rc-log-manager-storage');
+        if (storage) {
+            storage.textContent = diagnosticDbAvailable
+                ? `IndexedDB 持久化已启用；当前会话最多 32 MiB，全部日志最多 100 MiB，已结束会话保留 7 天。`
+                : 'IndexedDB 不可用，当前仅保留本页内存日志；刷新页面后这些日志会丢失。';
+        }
+        const lastClear = sharedStorageGet(DIAGNOSTIC_LAST_CLEAR_KEY, null);
+        const canRestore = Boolean(lastClear && Array.isArray(lastClear.sessionIds) && lastClear.sessionIds.length
+            && Number.isFinite(lastClear.clearedAt)
+            && Date.now() - lastClear.clearedAt <= CONFIG.DIAGNOSTIC_DELETE_GRACE_MS);
+        for (const id of ['rc-log-manager-export', 'rc-log-manager-export-clear']) {
+            const button = document.getElementById(id);
+            if (button) button.disabled = diagnosticExporting || !selected;
+        }
+        const clearButton = document.getElementById('rc-log-manager-clear');
+        if (clearButton) clearButton.disabled = diagnosticExporting || sessions.length === 0;
+        const restoreButton = document.getElementById('rc-log-manager-restore');
+        if (restoreButton) restoreButton.disabled = diagnosticExporting || !canRestore;
+    }
+
+    async function openDiagnosticManager() {
+        const manager = document.getElementById('rc-log-manager');
+        if (!manager) return;
+        const panelBody = document.getElementById('rc-panel-body');
+        if (panelBody) panelBody.style.display = 'flex';
+        manager.hidden = false;
+        setDiagnosticManagerMessage(diagnosticDbAvailable ? '正在读取本地日志信息…' : '正在读取本页日志信息…');
+        renderDiagnosticManager();
+        try {
+            await initializeDiagnosticStorage();
+            if (diagnosticDbAvailable) await cleanupDiagnosticDatabase();
+            await refreshDiagnosticStorageStats();
+            renderDiagnosticManager();
+            setDiagnosticManagerMessage(diagnosticDbAvailable ? '' : '当前浏览器未启用持久化日志，普通导出仍可使用。', diagnosticDbAvailable ? '' : 'warn');
+        } catch (err) {
+            setDiagnosticManagerMessage('读取日志信息失败：' + err.message, 'error');
+        }
+        document.getElementById('rc-log-manager-close')?.focus();
+    }
+
+    function closeDiagnosticManager() {
+        const manager = document.getElementById('rc-log-manager');
+        if (!manager || manager.hidden) return;
+        manager.hidden = true;
+        document.getElementById('rc-log-manage')?.focus();
+    }
+
+    async function runDiagnosticManagerAction(action) {
+        if (diagnosticExporting) return;
+        const select = document.getElementById('rc-log-manager-session');
+        const selectedId = select?.value || diagnosticSession.id;
+        const session = activeDiagnosticSessions().find(item => item.id === selectedId) || {
+            id: diagnosticSession.id, startedAt: diagnosticSession.startedAt,
+            eventCount: diagnosticStoredEventCount, storageBytes: diagnosticSessionBytes,
+        };
+        const mode = document.getElementById('rc-log-export-mode')?.value === 'detail' ? 'detail' : 'brief';
+        if (action === 'export') {
+            setDiagnosticManagerMessage('正在导出所选会话…');
+            const ok = await exportDiagnosticLog(mode, { sessionId: session.id });
+            setDiagnosticManagerMessage(ok ? '导出已完成；原日志仍然保留。' : '导出失败，请查看运行日志。', ok ? 'success' : 'error');
+            renderDiagnosticManager();
+            return;
+        }
+        if (action === 'export-clear') {
+            const confirmed = PAGE_WINDOW.confirm(
+                `将导出所选会话的 ${Number(session.eventCount) || 0} 条事件（${formatDiagnosticBytes(session.storageBytes)}），随后移入 24 小时可恢复区。继续吗？`);
+            if (!confirmed) return;
+            setDiagnosticManagerMessage('正在导出并清理所选会话…');
+            const ok = await exportDiagnosticLog(mode, { sessionId: session.id, clearAfter: true });
+            setDiagnosticManagerMessage(ok ? '所选会话已导出并移入 24 小时可恢复区。' : '导出或清理失败，请查看运行日志。', ok ? 'success' : 'error');
+            renderDiagnosticManager();
+            return;
+        }
+        if (action === 'clear') {
+            const sessions = activeDiagnosticSessions();
+            const bytes = sessions.reduce((sum, item) => sum + (Number(item.storageBytes) || 0), 0);
+            const confirmed = PAGE_WINDOW.confirm(
+                `将清理全部 ${sessions.length} 个诊断会话（${formatDiagnosticBytes(bytes)}）。日志会保留 24 小时并可恢复，继续吗？`);
+            if (!confirmed) return;
+            setDiagnosticManagerMessage('正在清理全部诊断日志…');
+            const ok = await clearDiagnosticLogs({ all: true });
+            setDiagnosticManagerMessage(ok ? '全部诊断日志已移入 24 小时可恢复区。' : '清理失败。', ok ? 'success' : 'error');
+            renderDiagnosticManager();
+            return;
+        }
+        if (action === 'restore') {
+            setDiagnosticManagerMessage('正在恢复最近清理的日志…');
+            const ok = await restoreLastDiagnosticClear();
+            setDiagnosticManagerMessage(ok ? '最近清理的日志已恢复。' : '没有可恢复的日志，或已经超过 24 小时。', ok ? 'success' : 'warn');
+            renderDiagnosticManager();
+        }
     }
 
     // ==================== UI — Pending List ====================
@@ -2725,6 +3545,7 @@
                             <option value="detail">详细</option>
                         </select>
                         <button id="rc-log-export" type="button" title="导出为 JSON 诊断日志">导出</button>
+                        <button id="rc-log-manage" type="button" title="查看会话、空间占用与清理选项">管理</button>
                     </div>
                 </div>
                 <div id="rc-panel-log"></div>
@@ -2764,6 +3585,32 @@
                     <div id="rc-quiz-results" aria-live="polite"></div>
                 </section>
             </div>
+            <div id="rc-log-manager" role="dialog" aria-modal="true" aria-labelledby="rc-log-manager-title" hidden>
+                <div id="rc-log-manager-dialog">
+                    <div id="rc-log-manager-header">
+                        <strong id="rc-log-manager-title">诊断日志管理</strong>
+                        <button id="rc-log-manager-close" type="button" title="关闭日志管理" aria-label="关闭日志管理">×</button>
+                    </div>
+                    <div class="rc-log-manager-metrics">
+                        <div><span>当前会话事件</span><strong id="rc-log-manager-current-events">0</strong></div>
+                        <div><span>当前会话占用</span><strong id="rc-log-manager-current-size">0 B</strong></div>
+                        <div><span>全部诊断会话</span><strong id="rc-log-manager-total">0 个 / 0 条</strong></div>
+                        <div><span>全部占用</span><strong id="rc-log-manager-total-size">0 B</strong></div>
+                    </div>
+                    <label id="rc-log-manager-session-label">选择会话
+                        <select id="rc-log-manager-session" aria-label="选择要管理或导出的诊断会话"></select>
+                    </label>
+                    <p id="rc-log-manager-session-info"></p>
+                    <p id="rc-log-manager-storage"></p>
+                    <div id="rc-log-manager-actions">
+                        <button id="rc-log-manager-export" type="button">导出所选</button>
+                        <button id="rc-log-manager-export-clear" type="button">导出并清理</button>
+                        <button id="rc-log-manager-clear" type="button" class="rc-log-danger">清空全部</button>
+                        <button id="rc-log-manager-restore" type="button">恢复最近清理</button>
+                    </div>
+                    <p id="rc-log-manager-status" role="status" aria-live="polite"></p>
+                </div>
+            </div>
         </div>`;
 
         const container = document.createElement('div');
@@ -2771,7 +3618,17 @@
         document.body.appendChild(container.firstElementChild);
         document.getElementById('rc-script-version').textContent = typeof GM_info !== 'undefined' ? GM_info.script?.version || '' : '';
         document.getElementById('rc-capture-status').textContent = '课件采集：' + coursewareStatus;
-        for (const entry of earlyLogs.splice(0)) appendLogEntry(entry);
+        const pendingEarlyLogs = earlyLogs.splice(0);
+        const renderedSequences = new Set();
+        for (const entry of diagnosticEvents.slice(-50).map(item => item.event)
+            .filter(event => event.userVisible && event.message)) {
+            appendLogEntry(entry);
+            if (Number(event.seq)) renderedSequences.add(Number(event.seq));
+        }
+        for (const entry of pendingEarlyLogs) {
+            if (Number(entry.seq) && renderedSequences.has(Number(entry.seq))) continue;
+            appendLogEntry(entry);
+        }
 
         // Button event bindings
         document.getElementById('rc-btn-minimize').addEventListener('click', () => {
@@ -2780,6 +3637,7 @@
         });
         document.getElementById('rc-btn-close').addEventListener('click', () => {
             panelClosed = true;
+            closeDiagnosticManager();
             syncPanelVisibility();
         });
         document.getElementById('rc-btn-select-all').addEventListener('click', onSelectAll);
@@ -2789,6 +3647,21 @@
         document.getElementById('rc-btn-recapture').addEventListener('click', onRecaptureCourseware);
         document.getElementById('rc-log-export').addEventListener('click', () => {
             exportDiagnosticLog(document.getElementById('rc-log-export-mode').value);
+        });
+        document.getElementById('rc-log-manage').addEventListener('click', () => {
+            openDiagnosticManager().catch(err => setDiagnosticManagerMessage('打开日志管理失败：' + err.message, 'error'));
+        });
+        document.getElementById('rc-log-manager-close').addEventListener('click', closeDiagnosticManager);
+        document.getElementById('rc-log-manager-session').addEventListener('change', renderDiagnosticManager);
+        document.getElementById('rc-log-manager-export').addEventListener('click', () => runDiagnosticManagerAction('export').catch(() => {}));
+        document.getElementById('rc-log-manager-export-clear').addEventListener('click', () => runDiagnosticManagerAction('export-clear').catch(() => {}));
+        document.getElementById('rc-log-manager-clear').addEventListener('click', () => runDiagnosticManagerAction('clear').catch(() => {}));
+        document.getElementById('rc-log-manager-restore').addEventListener('click', () => runDiagnosticManagerAction('restore').catch(() => {}));
+        document.getElementById('rc-log-manager').addEventListener('click', event => {
+            if (event.target === event.currentTarget) closeDiagnosticManager();
+        });
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape') closeDiagnosticManager();
         });
         document.getElementById('rc-panel-container').addEventListener('click', event => {
             const button = event.target.closest?.('button');
@@ -2957,6 +3830,57 @@
             }
             #rc-log-actions select { color-scheme: dark; }
             #rc-log-actions button:hover { background: #45475a; border-color: #89b4fa; }
+            #rc-log-manager {
+                position: absolute; inset: 0; z-index: 20; display: flex;
+                align-items: center; justify-content: center; padding: 12px;
+                background: rgba(17, 17, 27, 0.82); backdrop-filter: blur(2px);
+            }
+            #rc-log-manager-dialog {
+                width: min(420px, 100%); max-height: 100%; overflow-y: auto;
+                padding: 14px; border: 1px solid #45475a; border-radius: 8px;
+                background: #1e1e2e; box-shadow: 0 12px 36px rgba(0,0,0,0.48);
+            }
+            #rc-log-manager-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+            #rc-log-manager-title { font-size: 15px; color: #cdd6f4; }
+            #rc-log-manager-close {
+                width: 36px; height: 36px; padding: 0; border: 1px solid #45475a;
+                border-radius: 6px; background: #313244; color: #cdd6f4; cursor: pointer;
+            }
+            #rc-log-manager-close:hover { border-color: #f38ba8; color: #f38ba8; }
+            .rc-log-manager-metrics {
+                display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 8px; margin: 14px 0;
+            }
+            .rc-log-manager-metrics div {
+                display: grid; gap: 3px; min-width: 0; padding: 9px;
+                border: 1px solid #313244; border-radius: 6px; background: #181825;
+            }
+            .rc-log-manager-metrics span { color: #a6adc8; font-size: 11px; }
+            .rc-log-manager-metrics strong { color: #cdd6f4; overflow-wrap: anywhere; }
+            #rc-log-manager-session-label { display: grid; gap: 6px; color: #a6adc8; font-size: 11px; }
+            #rc-log-manager-session {
+                width: 100%; min-width: 0; min-height: 38px; padding: 7px 8px;
+                border: 1px solid #585b70; border-radius: 6px; background: #181825;
+                color: #cdd6f4; font: inherit; color-scheme: dark;
+            }
+            #rc-log-manager-session-info, #rc-log-manager-storage, #rc-log-manager-status {
+                margin: 9px 0 0; color: #a6adc8; font-size: 11px; line-height: 1.55;
+                overflow-wrap: anywhere;
+            }
+            #rc-log-manager-storage { color: #89b4fa; }
+            #rc-log-manager-status:empty { display: none; }
+            #rc-log-manager-status[data-level="success"] { color: #a6e3a1; }
+            #rc-log-manager-status[data-level="warn"] { color: #fab387; }
+            #rc-log-manager-status[data-level="error"] { color: #f38ba8; }
+            #rc-log-manager-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+            #rc-log-manager-actions button {
+                flex: 1 1 118px; min-height: 38px; padding: 7px 9px;
+                border: 1px solid #45475a; border-radius: 6px; background: #313244;
+                color: #cdd6f4; font: inherit; cursor: pointer;
+            }
+            #rc-log-manager-actions button:hover:not(:disabled) { background: #45475a; border-color: #89b4fa; }
+            #rc-log-manager-actions button:disabled { opacity: 0.42; cursor: not-allowed; }
+            #rc-log-manager-actions .rc-log-danger { border-color: #f38ba855; color: #f38ba8; }
             #rc-panel-log {
                 flex: 1; overflow-y: auto; padding: 6px 14px;
                 font-size: 11px; line-height: 1.6;
@@ -3021,6 +3945,9 @@
                 #rc-status-bar { flex-wrap: wrap; gap: 6px 14px; }
                 .rc-field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
                 #rc-answer-view { padding: 10px; }
+                #rc-log-manager { padding: 8px; }
+                #rc-log-manager-dialog { padding: 12px; }
+                #rc-log-manager-actions button { flex-basis: calc(50% - 4px); }
             }
         `);
     }
@@ -4028,6 +4955,7 @@
 
     // ==================== Initialization ====================
     function init() {
+        if (IS_TOP_WINDOW) initializeDiagnosticStorage().catch(() => {});
         recordDiagnosticEvent('lifecycle', 'init-start', '', {
             readyState: document.readyState, topWindow: IS_TOP_WINDOW,
             script: diagnosticScriptInfo(),
@@ -4134,6 +5062,21 @@
         GM_registerMenuCommand('重新采集课件（保留其他任务）', onRecaptureCourseware);
         GM_registerMenuCommand('导出诊断日志（简略）', () => exportDiagnosticLog('brief'));
         GM_registerMenuCommand('导出诊断日志（详细）', () => exportDiagnosticLog('detail'));
+        GM_registerMenuCommand('管理诊断日志', () => {
+            updatePageContext();
+            panelClosed = false;
+            manualPanel = true;
+            syncPanelVisibility();
+            requestAnimationFrame(() => {
+                openDiagnosticManager().catch(err => console.warn('[Rainclassroom] Diagnostic manager failed:', err));
+            });
+        });
+        GM_registerMenuCommand('清理全部诊断日志（24 小时可恢复）', () => {
+            if (!PAGE_WINDOW.confirm('将清理全部诊断日志；日志会保留 24 小时并可恢复。继续吗？')) return;
+            clearDiagnosticLogs({ all: true })
+                .then(ok => uiLog(ok ? '诊断日志已清理；24 小时内可恢复。' : '诊断日志清理失败。', ok ? 'success' : 'error'))
+                .catch(err => uiLog('诊断日志清理失败：' + err.message, 'error'));
+        });
     }
 
     init();

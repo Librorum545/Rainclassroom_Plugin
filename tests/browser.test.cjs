@@ -417,6 +417,74 @@ test('headless browser fixture covers userscript injection and classroom flows',
         assert.ok(exported.events.some(event => event.event === 'submission-confirmed'));
         assert.doesNotMatch(JSON.stringify(exported), /test-key/);
 
+        // Diagnostic manager regression coverage follows the export checks.
+        await cdp.evaluate(`document.getElementById('rc-log-manage').click()`);
+        await waitFor(() => cdp.evaluate(`document.getElementById('rc-log-manager').hidden === false`), 'diagnostic manager to open');
+        await waitFor(() => cdp.evaluate(`document.getElementById('rc-log-manager-status').textContent === ''`), 'diagnostic manager to finish loading');
+        const managerState = await cdp.evaluate(`({
+            sessions: document.getElementById('rc-log-manager-session').options.length,
+            currentEvents: Number(document.getElementById('rc-log-manager-current-events').textContent),
+            total: document.getElementById('rc-log-manager-total').textContent,
+            storage: document.getElementById('rc-log-manager-storage').textContent,
+            status: document.getElementById('rc-log-manager-status').textContent,
+        })`);
+        assert.ok(managerState.sessions >= 1);
+        assert.ok(managerState.currentEvents > 0);
+        assert.match(managerState.total, /\d+ 个 \/ \d+ 条/);
+        assert.match(managerState.storage, /IndexedDB 持久化已启用/);
+        assert.equal(managerState.status, '');
+
+        await cdp.send('Emulation.setDeviceMetricsOverride', { width: 320, height: 640, deviceScaleFactor: 1, mobile: true });
+        await waitFor(() => cdp.evaluate(`window.innerWidth === 320`), 'mobile viewport for diagnostic manager');
+        const mobileManager = await cdp.evaluate(`(() => {
+            const dialog = document.getElementById('rc-log-manager-dialog');
+            const rect = dialog.getBoundingClientRect();
+            return {
+                left: rect.left, right: rect.right, width: rect.width, viewport: innerWidth,
+                horizontalOverflow: dialog.scrollWidth > dialog.clientWidth + 1,
+                actionCount: document.querySelectorAll('#rc-log-manager-actions button').length,
+            };
+        })()`);
+        assert.ok(mobileManager.left >= 0 && mobileManager.right <= mobileManager.viewport + 0.5,
+            `Diagnostic manager overflows mobile viewport: ${JSON.stringify(mobileManager)}`);
+        assert.equal(mobileManager.horizontalOverflow, false);
+        assert.equal(mobileManager.actionCount, 4);
+        await cdp.send('Emulation.clearDeviceMetricsOverride');
+        await cdp.evaluate(`document.getElementById('rc-log-manager-close').click()`);
+
+        // Leave enough time for the 500 ms persistence debounce to commit the final event segment.
+        await delay(800);
+        await cdp.send('Page.reload', { ignoreCache: true });
+        await waitFor(() => cdp.evaluate(`document.readyState === 'complete' && !!document.getElementById('rc-panel-container')`), 'fixture reload with persisted diagnostics');
+        await cdp.evaluate(`(() => {
+            window.__rcDiagnosticBlob = null;
+            URL.createObjectURL = blob => { window.__rcDiagnosticBlob = blob; return 'blob:persisted-diagnostic-test'; };
+            HTMLAnchorElement.prototype.click = () => {};
+            document.getElementById('rc-log-export-mode').value = 'detail';
+            document.getElementById('rc-log-manage').click();
+        })()`);
+        await waitFor(() => cdp.evaluate(`document.getElementById('rc-log-manager').hidden === false`), 'diagnostic manager after reload');
+        await cdp.evaluate(`document.getElementById('rc-log-manager-export').click()`);
+        const persistedExport = await waitFor(async () => {
+            const raw = await cdp.evaluate(`window.__rcDiagnosticBlob ? window.__rcDiagnosticBlob.text() : ''`);
+            return raw ? JSON.parse(raw) : null;
+        }, 'diagnostic export after reload');
+        assert.equal(persistedExport.session.id, exported.session.id, 'Reload must continue the same tab session');
+        assert.ok(persistedExport.events.some(event => event.event === 'submission-confirmed'),
+            'Reloaded session must retain events committed before the page reload');
+
+        await cdp.evaluate(`(() => {
+            window.confirm = () => true;
+            document.getElementById('rc-log-manager-clear').click();
+        })()`);
+        await waitForText(cdp, '#rc-log-manager-status', '24 小时可恢复区', 8000);
+        assert.equal(await cdp.evaluate(`document.getElementById('rc-log-manager-restore').disabled`), false,
+            'Soft-deleted diagnostics must be restorable');
+        await cdp.evaluate(`document.getElementById('rc-log-manager-restore').click()`);
+        await waitForText(cdp, '#rc-log-manager-status', '已恢复', 8000);
+        assert.ok(await cdp.evaluate(`document.getElementById('rc-log-manager-session').options.length >= 2`),
+            'Restored sessions must appear alongside the newly started current session');
+
         assert.deepEqual(runtimeErrors, []);
         assert.deepEqual(consoleErrors, []);
         assert.deepEqual(await cdp.evaluate(`window.fixtureDiagnostics.errors`), []);
