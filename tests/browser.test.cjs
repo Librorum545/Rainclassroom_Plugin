@@ -9,6 +9,9 @@ const { startFixtureServer } = require('./browser-server.cjs');
 
 const scriptVersion = /^\/\/\s*@version\s+(\S+)\s*$/m.exec(fs.readFileSync(require.resolve('../main.js'), 'utf8'))?.[1];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function parseDiagnosticJsonl(raw) {
+    return raw.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+}
 
 function findBrowser() {
     const candidates = [];
@@ -408,13 +411,17 @@ test('headless browser fixture covers userscript injection and classroom flows',
         })()`);
         const exported = await waitFor(async () => {
             const raw = await cdp.evaluate(`window.__rcDiagnosticBlob ? window.__rcDiagnosticBlob.text() : ''`);
-            return raw ? JSON.parse(raw) : null;
-        }, 'diagnostic JSON export');
-        assert.equal(exported.packageType, 'rain-classroom-plugin-diagnostics');
-        assert.equal(exported.mode, 'detail');
-        assert.equal(exported.script.version, scriptVersion);
-        assert.ok(exported.events.some(event => event.category === 'courseware'));
-        assert.ok(exported.events.some(event => event.event === 'submission-confirmed'));
+            return raw ? parseDiagnosticJsonl(raw) : null;
+        }, 'diagnostic JSONL export');
+        const exportedHeader = exported.find(record => record.type === 'header');
+        const exportedSession = exported.find(record => record.type === 'session');
+        const exportedEvents = exported.filter(record => record.type === 'event');
+        assert.equal(exportedHeader.packageType, 'rain-classroom-plugin-diagnostics');
+        assert.equal(exportedHeader.schemaVersion, 3);
+        assert.equal(exportedHeader.mode, 'detail');
+        assert.equal(exportedSession.data.script.version, scriptVersion);
+        assert.ok(exportedEvents.some(event => event.category === 'courseware'));
+        assert.ok(exportedEvents.some(event => event.name === 'submission-confirmed'));
         assert.doesNotMatch(JSON.stringify(exported), /test-key/);
 
         // Diagnostic manager regression coverage follows the export checks.
@@ -467,10 +474,12 @@ test('headless browser fixture covers userscript injection and classroom flows',
         await cdp.evaluate(`document.getElementById('rc-log-manager-export').click()`);
         const persistedExport = await waitFor(async () => {
             const raw = await cdp.evaluate(`window.__rcDiagnosticBlob ? window.__rcDiagnosticBlob.text() : ''`);
-            return raw ? JSON.parse(raw) : null;
+            return raw ? parseDiagnosticJsonl(raw) : null;
         }, 'diagnostic export after reload');
-        assert.equal(persistedExport.session.id, exported.session.id, 'Reload must continue the same tab session');
-        assert.ok(persistedExport.events.some(event => event.event === 'submission-confirmed'),
+        const persistedSession = persistedExport.find(record => record.type === 'session');
+        const persistedEvents = persistedExport.filter(record => record.type === 'event');
+        assert.equal(persistedSession.id, exportedSession.id, 'Reload must continue the same tab session');
+        assert.ok(persistedEvents.some(event => event.name === 'submission-confirmed'),
             'Reloaded session must retain events committed before the page reload');
 
         await cdp.evaluate(`(() => {

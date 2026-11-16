@@ -7,6 +7,14 @@ const { webcrypto } = require('node:crypto');
 const source = fs.readFileSync(require.resolve('../main.js'), 'utf8');
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 const tick = () => new Promise(resolve => setImmediate(resolve));
+function diagnosticLeaves(node, type = 'event', result = []) {
+    if (node?.type === type) result.push(node);
+    for (const child of node?.children || []) diagnosticLeaves(child, type, result);
+    return result;
+}
+function parseDiagnosticJsonl(raw) {
+    return raw.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+}
 async function waitUntil(probe, label, timeout = 1500) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
@@ -94,7 +102,7 @@ function harness(options = {}) {
         setupFrameRelay, setupQuizSocket, recoverQuizPage, observeAnswerRequest, quizQuestions, localQuestions,
         applyQuizSettings, validateQuizSettings, parseAIAnswer, randomChoices, aiEndpoint, claimQuizAttempt, QUIZ_DEFAULTS,
         submitQuizAnswer, testAIConnection, quizKey, frameId, IS_TOP_WINDOW,
-        uiLog, recordDiagnosticEvent, buildDiagnosticPackage, diagnosticEvents,
+        uiLog, recordDiagnosticEvent, buildDiagnosticPackage, diagnosticPackageBlob, diagnosticEvents,
         settings: () => quizSettings, page: PAGE_WINDOW,
     };`), window);
     const api = window.api;
@@ -179,15 +187,24 @@ test('diagnostic export separates brief and detailed logs and redacts credential
     const now = new Date(h.now());
     const brief = h.buildDiagnosticPackage('brief', now);
     const detail = h.buildDiagnosticPackage('detail', now);
-    assert.ok(brief.events.some(event => event.message === '用户可见日志'));
-    assert.ok(!brief.events.some(event => event.event === 'request-start'));
-    const exchange = detail.events.find(event => event.event === 'request-start' && event.details?.body);
-    assert.equal(exchange.details.headers.Authorization, '<redacted>');
-    assert.equal(exchange.details.headers.Cookie, '<redacted>');
-    assert.equal(exchange.details.body.messages[0].content, '完整题干与选项');
-    assert.doesNotMatch(exchange.details.url, /url-secret/);
+    const briefEvents = diagnosticLeaves(brief.sessionNode);
+    const detailEvents = diagnosticLeaves(detail.sessionNode);
+    assert.ok(briefEvents.some(event => event.message === '用户可见日志'));
+    assert.ok(!briefEvents.some(event => event.name === 'request-start'));
+    const exchange = detailEvents.find(event => event.name === 'request-start' && event.data?.body);
+    assert.equal(exchange.data.headers.Authorization, '<redacted>');
+    assert.equal(exchange.data.headers.Cookie, '<redacted>');
+    assert.equal(exchange.data.body.messages[0].content, '完整题干与选项');
+    assert.doesNotMatch(exchange.data.url, /url-secret/);
     assert.equal(detail.diagnostics.fullAiPayloadIncluded, true);
     assert.equal(brief.diagnostics.fullAiPayloadIncluded, false);
+    assert.equal(detail.header.schemaVersion, 3);
+    assert.equal(detail.header.schema, 'rain-classroom-plugin-diagnostics.jsonl');
+    const nodes = diagnosticLeaves(detail.sessionNode, 'node');
+    const ids = new Set([detail.sessionNode.id, ...nodes.map(node => node.id), ...detailEvents.map(event => event.id)]);
+    assert.ok(detailEvents.every(event => ids.has(event.parentId)), 'every event must have an exported parent');
+    assert.ok(nodes.some(node => node.kind === 'frameRun'));
+    assert.ok(nodes.some(node => node.kind === 'httpExchange'));
 });
 test('detailed diagnostic export records the complete AI request and raw response', async () => {
     const h = harness(); enable(h, { mode: 'ai-display' }); h.capture(); h.unlock();
@@ -196,25 +213,65 @@ test('detailed diagnostic export records the complete AI request and raw respons
     h.requests[0].onload({ status: 200, responseText: rawResponse });
     await flush();
     const detail = h.buildDiagnosticPackage('detail', new Date(h.now()));
-    const request = detail.events.find(event => event.event === 'request-start' && event.details?.kind === 'quiz-chat');
-    const response = detail.events.find(event => event.event === 'request-complete' && event.details?.kind === 'quiz-chat');
-    assert.ok(request.details.body.messages.some(message => message.role === 'system'));
-    assert.ok(request.details.body.messages.some(message => message.role === 'user'));
-    assert.equal(request.details.headers.Authorization, '<redacted>');
-    assert.equal(response.details.responseText, rawResponse);
+    const events = diagnosticLeaves(detail.sessionNode);
+    const request = events.find(event => event.name === 'request-start' && event.data?.kind === 'quiz-chat');
+    const response = events.find(event => event.name === 'request-complete' && event.data?.kind === 'quiz-chat');
+    assert.ok(request.data.body.messages.some(message => message.role === 'system'));
+    assert.ok(request.data.body.messages.some(message => message.role === 'user'));
+    assert.equal(request.data.headers.Authorization, '<redacted>');
+    assert.equal(response.data.responseText, rawResponse);
+    assert.equal(request.links.operationId, response.links.operationId);
+    assert.equal(request.parentId, response.parentId);
+});
+test('tree JSONL externalizes oversized values into referenced payload lines', async () => {
+    const h = harness();
+    h.recordDiagnosticEvent('diagnostics', 'payload-test', '', { text: 'x'.repeat(50000) });
+    const detail = h.buildDiagnosticPackage('detail', new Date(h.now()));
+    const blob = await h.diagnosticPackageBlob(detail);
+    const records = parseDiagnosticJsonl(await blob.text());
+    assert.equal(records[0].type, 'header');
+    assert.equal(records.at(-1).type, 'summary');
+    const event = records.find(record => record.type === 'event' && record.name === 'payload-test');
+    assert.match(event.data.$payloadRef, /^payload:sha256:/);
+    const payload = records.find(record => record.type === 'payload' && record.id === event.data.$payloadRef);
+    assert.equal(payload.data.text.length, 50000);
+    assert.equal(payload.parentId, records.find(record => record.type === 'session').id);
+    assert.ok(records.every(record => !Object.hasOwn(record, 'children')));
+    assert.equal(records.at(-1).integrity.missingParents, 0);
+    assert.equal(records.at(-1).integrity.missingPayloads, 0);
+});
+test('repeated runtime errors keep every occurrence under one exception parent', () => {
+    const h = harness();
+    const error = { name: 'TypeError', message: 'same failure', stack: 'TypeError: same failure\n    at run' };
+    for (let index = 0; index < 12; index++) {
+        h.recordDiagnosticEvent('runtime', 'window-error', 'same failure', {
+            source: 'https://example.test/userscript.js', line: 93, column: 7, error,
+        }, { level: 'error' });
+    }
+    const detail = h.buildDiagnosticPackage('detail', new Date(h.now()));
+    const groups = diagnosticLeaves(detail.sessionNode, 'node').filter(node => node.kind === 'exceptionGroup');
+    const occurrences = diagnosticLeaves(detail.sessionNode).filter(event => event.name === 'window-error');
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].data.occurrences, 12);
+    assert.match(groups[0].data.error.stack, /at run/);
+    assert.equal(occurrences.length, 12);
+    assert.ok(occurrences.every(event => event.parentId === groups[0].id));
+    assert.ok(occurrences.every(event => event.data === undefined));
 });
 test('repeated identical slide recovery does not duplicate status or submission logs', async () => {
     const h = harness(); enable(h, { delay: 1 }); h.capture(); h.unlock();
     await h.advance(1000);
     const before = h.buildDiagnosticPackage('detail', new Date(h.now()));
-    const beforeUpdated = before.events.filter(event => event.event === 'question-updated').length;
-    const beforeSlides = before.events.filter(event => event.event === 'slide-data-captured').length;
+    const beforeEvents = diagnosticLeaves(before.sessionNode);
+    const beforeUpdated = beforeEvents.filter(event => event.name === 'question-updated').length;
+    const beforeSlides = beforeEvents.filter(event => event.name === 'slide-data-captured').length;
     for (let index = 0; index < 25; index++) h.capture();
     const after = h.buildDiagnosticPackage('detail', new Date(h.now()));
-    assert.equal(after.events.filter(event => event.event === 'question-updated').length, beforeUpdated);
-    assert.equal(after.events.filter(event => event.event === 'slide-data-captured').length, beforeSlides);
-    assert.equal(after.events.filter(event => event.event === 'submission-confirmed').length, 1);
-    assert.equal(after.events.filter(event => event.event === 'source-submit-complete').length, 1);
+    const afterEvents = diagnosticLeaves(after.sessionNode);
+    assert.equal(afterEvents.filter(event => event.name === 'question-updated').length, beforeUpdated);
+    assert.equal(afterEvents.filter(event => event.name === 'slide-data-captured').length, beforeSlides);
+    assert.equal(afterEvents.filter(event => event.name === 'submission-confirmed').length, 1);
+    assert.equal(afterEvents.filter(event => event.name === 'source-submit-complete').length, 1);
 });
 test('AI timeout falls back exactly once; late response cannot submit again', async () => {
     const h = harness(); enable(h, { mode: 'ai-auto', timeout: 2 }); h.capture(); h.unlock();

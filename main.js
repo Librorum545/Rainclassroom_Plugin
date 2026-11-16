@@ -2,7 +2,7 @@
 // @name         Rain Classroom Courseware Plugin
 // @name:zh-CN   雨课堂课程助手
 // @namespace    https://github.com/Librorum545/Rainclassroom_Plugin
-// @version      1.6.0
+// @version      1.7.0
 // @updateURL    https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @downloadURL  https://raw.githubusercontent.com/Librorum545/Rainclassroom_Plugin/main/main.js
 // @description  Download Rain Classroom courseware and recordings, with optional quiz assistance
@@ -79,6 +79,7 @@
         DIAGNOSTIC_SEGMENT_EVENTS: 128,
         DIAGNOSTIC_SEGMENT_BYTES: 1024 * 1024,
         MAX_DIAGNOSTIC_PAYLOAD_BYTES: 2 * 1024 * 1024,
+        DIAGNOSTIC_EXPORT_INLINE_BYTES: 32 * 1024,
         AI_RETRY_DELAY_MS: 500,       // Delay between retries after an AI format error.
         QUIZ_DEADLINE_SYNC_MS: 3000,  // Ignore countdown jitter smaller than this.
         MAX_CHANNEL_BYTES: 20 * 1024 * 1024,
@@ -1639,16 +1640,17 @@
         if (!json || typeof json !== 'object') return;
         const endpoint = apiEndpoint(url);
         if (!endpoint) return;
+        const operationId = 'courseware:' + createItemId();
         if (IS_TOP_WINDOW) {
             recordDiagnosticEvent('courseware', 'api-response-observed', '', {
                 endpoint: sanitizeDiagnosticURL(endpoint), relayed: options.relayed === true,
                 recover: options.recover === true, responseCode: json.code,
                 slideCount: Array.isArray(json?.data?.slides) ? json.data.slides.length : undefined,
-            });
+            }, { operationId });
         }
         // Process only the frame's own response; relayed copies must not change
         // the source frame responsible for authenticated answer submission.
-        if (!options.relayed) captureQuestionSlides(json);
+        if (!options.relayed) captureQuestionSlides(json, { operationId });
         const requestKey = apiRequestKey(url);
         observedApiResponses.add(requestKey);
         if (isCoursewareApi(url)) {
@@ -2027,7 +2029,7 @@
     }
 
     // ==================== Diagnostics and UI log ====================
-    const DIAGNOSTIC_SCHEMA_VERSION = 2;
+    const DIAGNOSTIC_SCHEMA_VERSION = 3;
     const DIAGNOSTIC_DB_NAME = 'rc_diagnostics_v2';
     const DIAGNOSTIC_DB_VERSION = 1;
     const DIAGNOSTIC_SESSION_KEY = 'rc_diagnostic_session_v2';
@@ -2650,6 +2652,9 @@
             frame: remoteFrame ? 'embedded' : (IS_TOP_WINDOW ? 'top' : 'embedded'),
             frameId: String(remoteFrame || input.frameId || frameId).slice(0, 100),
             userVisible: input.userVisible === true,
+            ...(input.operationId ? { operationId: String(input.operationId).slice(0, 200) } : {}),
+            ...(input.actionId ? { actionId: String(input.actionId).slice(0, 200) } : {}),
+            ...(input.traceId ? { traceId: String(input.traceId).slice(0, 200) } : {}),
             ...(message ? { message } : {}),
             ...(input.uiType ? { uiType: String(input.uiType).slice(0, 20) } : {}),
             ...(input.details !== undefined ? { details: sanitizeDiagnosticValue(input.details) } : {}),
@@ -2675,21 +2680,27 @@
     }
 
     function recordDiagnosticEvent(category, event, message = '', details = undefined, options = {}) {
+        const operationId = options.operationId || details?.operationId;
+        const actionId = options.actionId || details?.actionId;
+        const traceId = options.traceId || details?.traceId;
         const payload = {
             time: new Date().toISOString(),
             elapsedMs: Math.max(0, Date.now() - diagnosticSession.startedAt),
             level: options.level || 'debug',
             category, event, message, userVisible: options.userVisible === true,
             uiType: options.uiType || '', frameId, details: sanitizeDiagnosticValue(details),
+            ...(operationId ? { operationId: String(operationId).slice(0, 200) } : {}),
+            ...(actionId ? { actionId: String(actionId).slice(0, 200) } : {}),
+            ...(traceId ? { traceId: String(traceId).slice(0, 200) } : {}),
         };
         if (IS_TOP_WINDOW) return appendDiagnosticEvent(payload);
         forwardCapture({ kind: 'diagnostic', event: payload });
         return null;
     }
 
-    function diagnosticErrorEvent(category, event, err, message = '') {
+    function diagnosticErrorEvent(category, event, err, message = '', options = {}) {
         return recordDiagnosticEvent(category, event, message || err?.message || String(err || ''),
-            { error: sanitizeDiagnosticError(err) }, { level: 'error' });
+            { error: sanitizeDiagnosticError(err) }, { ...options, level: 'error' });
     }
 
     function appendLogEntry(event) {
@@ -2871,42 +2882,332 @@
         };
     }
 
+    function diagnosticExportText(value, maxLength = 200) {
+        return value === undefined || value === null ? '' : String(value).slice(0, maxLength);
+    }
+
+    function diagnosticExportLinks(event) {
+        const details = event?.details && typeof event.details === 'object' ? event.details : {};
+        const questionId = diagnosticExportText(event?.questionId || details.questionId, 100);
+        const lessonId = diagnosticExportText(event?.lessonId || details.lessonId, 100);
+        const explicitExchangeId = diagnosticExportText(event?.exchangeId || details.exchangeId, 200);
+        const exchangeId = explicitExchangeId || (/^request-/.test(String(event?.event || ''))
+            ? `fallback:${diagnosticExportText(event?.frameId || 'unknown', 100)}:${Number(event?.seq) || 0}`
+            : '');
+        const actionId = diagnosticExportText(event?.actionId || details.actionId, 200);
+        const traceId = diagnosticExportText(event?.traceId || details.traceId, 200);
+        const explicitOperationId = diagnosticExportText(event?.operationId || details.operationId, 200);
+        const operationId = explicitOperationId
+            || (questionId ? `legacy-quiz:${lessonId || 'unknown'}:${questionId}` : '');
+        return {
+            ...(operationId ? { operationId } : {}),
+            ...(questionId ? { questionId } : {}),
+            ...(lessonId ? { lessonId } : {}),
+            ...(exchangeId ? { exchangeId } : {}),
+            ...(actionId ? { actionId } : {}),
+            ...(traceId ? { traceId } : {}),
+        };
+    }
+
+    function diagnosticExportOperationKind(operationId, event) {
+        if (operationId.startsWith('courseware:')) return 'coursewareCapture';
+        if (operationId.startsWith('quiz:')) return 'quizAttempt';
+        if (operationId.startsWith('connection-test:')) return 'aiConnectionTest';
+        if (event?.category === 'ai') return 'aiOperation';
+        if (event?.category === 'quiz') return 'quizAttempt';
+        return 'operation';
+    }
+
+    function diagnosticExportEventRecord(event, id, parentId, links, mode, options = {}) {
+        const message = options.message === undefined ? event.message : options.message;
+        const sourceFrame = diagnosticExportText(event.frameId || 'unknown', 100) || 'unknown';
+        return {
+            type: 'event',
+            id,
+            parentId,
+            category: diagnosticExportText(event.category || 'general', 40) || 'general',
+            name: diagnosticExportText(event.event || 'event', 80) || 'event',
+            at: typeof event.time === 'string' ? event.time : new Date().toISOString(),
+            elapsedMs: Math.max(0, Number(event.elapsedMs) || 0),
+            level: ['debug', 'info', 'success', 'warn', 'error'].includes(event.level) ? event.level : 'info',
+            userVisible: event.userVisible === true,
+            source: {
+                frame: diagnosticExportText(event.frame || 'unknown', 20) || 'unknown',
+                frameId: sourceFrame,
+                seq: Number(event.seq) || 0,
+            },
+            ...(message ? { message: String(message).slice(0, 20000) } : {}),
+            ...(event.uiType ? { uiType: diagnosticExportText(event.uiType, 20) } : {}),
+            ...(Object.keys(links).length ? { links } : {}),
+            ...(mode === 'detail' && options.data !== undefined ? { data: options.data } : {}),
+        };
+    }
+
     function buildDiagnosticPackage(mode = 'brief', now = new Date(), sourceEvents = undefined, options = {}) {
         mode = mode === 'detail' ? 'detail' : 'brief';
         const allEvents = Array.isArray(sourceEvents) ? sourceEvents : diagnosticEvents.map(entry => entry.event);
         const selected = allEvents.filter(event => mode === 'detail' || event.userVisible);
-        const events = selected.map(event => {
-            if (mode === 'detail') return event;
-            return {
-                time: event.time, elapsedMs: event.elapsedMs, level: event.level,
-                category: event.category, event: event.event, frame: event.frame,
-                message: event.message || '',
-            };
-        });
+        const ordered = selected.map((event, index) => ({ event, index })).sort((a, b) => {
+            const aTime = Date.parse(a.event.time);
+            const bTime = Date.parse(b.event.time);
+            return (Number.isFinite(aTime) ? aTime : 0) - (Number.isFinite(bTime) ? bTime : 0)
+                || String(a.event.frameId || '').localeCompare(String(b.event.frameId || ''))
+                || (Number(a.event.seq) || 0) - (Number(b.event.seq) || 0)
+                || a.index - b.index;
+        }).map(item => item.event);
+
         const byCategory = {};
         const byLevel = {};
-        for (const event of events) {
-            byCategory[event.category] = (byCategory[event.category] || 0) + 1;
-            byLevel[event.level] = (byLevel[event.level] || 0) + 1;
+        for (const event of ordered) {
+            const category = diagnosticExportText(event.category || 'general', 40) || 'general';
+            const level = ['debug', 'info', 'success', 'warn', 'error'].includes(event.level) ? event.level : 'info';
+            byCategory[category] = (byCategory[category] || 0) + 1;
+            byLevel[level] = (byLevel[level] || 0) + 1;
         }
-        const lastError = [...events].reverse().find(event => event.level === 'error');
-        return {
-            schemaVersion: DIAGNOSTIC_SCHEMA_VERSION,
-            packageType: 'rain-classroom-plugin-diagnostics',
-            mode,
-            generatedAt: now.toISOString(),
-            session: {
-                id: String(options.sessionId || diagnosticSession.id),
-                startedAt: new Date(options.startedAt || diagnosticSession.startedAt).toISOString(),
-                durationMs: Math.max(0, now.getTime() - (options.startedAt || diagnosticSession.startedAt)),
-                endedAt: options.endedAt ? new Date(options.endedAt).toISOString() : undefined,
+        const lastError = [...ordered].reverse().find(event => event.level === 'error');
+        const rawSessionId = String(options.sessionId || diagnosticSession.id);
+        const sessionId = 'session:' + rawSessionId;
+        const startedAtMs = Number(options.startedAt || diagnosticSession.startedAt);
+        const sessionNode = {
+            type: 'session',
+            id: sessionId,
+            parentId: null,
+            startedAt: new Date(startedAtMs).toISOString(),
+            durationMs: Math.max(0, now.getTime() - startedAtMs),
+            ...(options.endedAt ? { endedAt: new Date(options.endedAt).toISOString() } : {}),
+            data: {
+                script: diagnosticScriptInfo(),
+                environment: diagnosticEnvironment(),
+                settings: diagnosticSettingsSnapshot(),
             },
-            script: diagnosticScriptInfo(),
-            environment: diagnosticEnvironment(),
-            settings: diagnosticSettingsSnapshot(),
-            state: diagnosticStateSnapshot(mode),
+            children: [{
+                type: 'node',
+                id: 'snapshot:' + rawSessionId,
+                parentId: sessionId,
+                kind: 'stateSnapshot',
+                at: now.toISOString(),
+                data: diagnosticStateSnapshot(mode),
+                children: [],
+            }],
+        };
+
+        const runNodes = new Map();
+        const operationNodes = new Map();
+        const requestNodes = new Map();
+        const interactionNodes = new Map();
+        const categoryNodes = new Map();
+        const exceptionNodes = new Map();
+        const eventIds = new Set();
+        let orphanEventCount = 0;
+
+        const ensureRun = event => {
+            const rawFrameId = diagnosticExportText(event.frameId || '', 100);
+            const frameKey = rawFrameId || 'unassigned';
+            let node = runNodes.get(frameKey);
+            if (!node) {
+                node = {
+                    type: 'node',
+                    id: 'run:' + frameKey,
+                    parentId: sessionId,
+                    kind: 'frameRun',
+                    startedAt: typeof event.time === 'string' ? event.time : now.toISOString(),
+                    endedAt: typeof event.time === 'string' ? event.time : now.toISOString(),
+                    data: {
+                        frameId: frameKey,
+                        role: diagnosticExportText(event.frame || 'unknown', 20) || 'unknown',
+                        ...(rawFrameId ? {} : { unassigned: true }),
+                    },
+                    children: [],
+                };
+                runNodes.set(frameKey, node);
+                sessionNode.children.push(node);
+            }
+            if (event.time && Date.parse(event.time) > Date.parse(node.endedAt)) node.endedAt = event.time;
+            return node;
+        };
+
+        const ensureOperation = (run, links, event) => {
+            const operationId = links.operationId;
+            if (!operationId || !operationId.trim()) return null;
+            let node = operationNodes.get(operationId);
+            if (node) return node;
+            const details = event.details && typeof event.details === 'object' ? event.details : {};
+            node = {
+                type: 'node',
+                id: 'operation:' + operationId,
+                parentId: run.id,
+                kind: diagnosticExportOperationKind(operationId, event),
+                startedAt: event.time,
+                endedAt: event.time,
+                data: {
+                    operationId,
+                    ...(links.questionId ? { questionId: links.questionId } : {}),
+                    ...(links.lessonId ? { lessonId: links.lessonId } : {}),
+                    ...(details.title ? { title: diagnosticExportText(details.title, 500) } : {}),
+                    ...(details.mode ? { mode: diagnosticExportText(details.mode, 40) } : {}),
+                },
+                children: [],
+            };
+            operationNodes.set(operationId, node);
+            run.children.push(node);
+            return node;
+        };
+
+        const ensureRequest = (run, operation, links, event) => {
+            if (!links.exchangeId) return null;
+            let node = requestNodes.get(links.exchangeId);
+            const parent = operation || run;
+            if (!node) {
+                node = {
+                    type: 'node',
+                    id: 'request:' + links.exchangeId,
+                    parentId: parent.id,
+                    kind: 'httpExchange',
+                    startedAt: event.time,
+                    endedAt: event.time,
+                    data: {
+                        exchangeId: links.exchangeId,
+                        ...(event.details?.kind ? { kind: diagnosticExportText(event.details.kind, 80) } : {}),
+                    },
+                    children: [],
+                };
+                requestNodes.set(links.exchangeId, node);
+                parent.children.push(node);
+            } else if (event.time && Date.parse(event.time) > Date.parse(node.endedAt)) node.endedAt = event.time;
+            return node;
+        };
+
+        const ensureInteraction = (run, links, event) => {
+            const actionId = links.actionId;
+            if (!actionId) return null;
+            let node = interactionNodes.get(actionId);
+            if (!node) {
+                node = {
+                    type: 'node',
+                    id: 'interaction:' + actionId,
+                    parentId: run.id,
+                    kind: 'interaction',
+                    startedAt: event.time,
+                    endedAt: event.time,
+                    data: { actionId },
+                    children: [],
+                };
+                interactionNodes.set(actionId, node);
+                run.children.push(node);
+            } else if (event.time && Date.parse(event.time) > Date.parse(node.endedAt)) node.endedAt = event.time;
+            return node;
+        };
+
+        const ensureCategoryNode = (run, prefix, kind, event, data = {}) => {
+            const id = prefix + ':' + run.id;
+            let node = categoryNodes.get(id);
+            if (!node) {
+                node = { type: 'node', id, parentId: run.id, kind,
+                    startedAt: event.time, endedAt: event.time, data, children: [] };
+                categoryNodes.set(id, node);
+                run.children.push(node);
+            } else if (event.time && Date.parse(event.time) > Date.parse(node.endedAt)) node.endedAt = event.time;
+            return node;
+        };
+
+        const ensureException = (run, event) => {
+            const details = event.details && typeof event.details === 'object' ? event.details : {};
+            let serializedDetails = '';
+            try { serializedDetails = JSON.stringify(details); } catch (err) { serializedDetails = String(details.source || ''); }
+            const fingerprint = [event.message || '', serializedDetails].join('\u0000');
+            const key = run.id + ':' + shortFingerprint(fingerprint);
+            let node = exceptionNodes.get(key);
+            if (!node) {
+                node = {
+                    type: 'node', id: 'exception:' + key.slice(4), parentId: run.id,
+                    kind: 'exceptionGroup', startedAt: event.time, endedAt: event.time,
+                    data: {
+                        message: diagnosticExportText(event.message || '', 2000),
+                        source: diagnosticExportText(details.source || '', 2000),
+                        line: Number(details.line) || 0,
+                        column: Number(details.column) || 0,
+                        error: details.error
+                            ? sanitizeDiagnosticError(details.error)
+                            : sanitizeDiagnosticError(event.message || 'Unknown error'),
+                        occurrences: 0,
+                    },
+                    children: [],
+                };
+                exceptionNodes.set(key, node);
+                run.children.push(node);
+            }
+            node.data.occurrences = (Number(node.data.occurrences) || 0) + 1;
+            if (event.time && Date.parse(event.time) > Date.parse(node.endedAt)) node.endedAt = event.time;
+            return node;
+        };
+
+        for (const event of ordered) {
+            const links = diagnosticExportLinks(event);
+            const rawFrameId = diagnosticExportText(event.frameId || 'unknown', 100) || 'unknown';
+            const rawSeq = Number(event.seq) || 0;
+            const baseEventId = `event:${rawFrameId}:${rawSeq}`;
+            let eventId = baseEventId;
+            let duplicateIndex = 2;
+            while (eventIds.has(eventId)) eventId = baseEventId + ':duplicate-' + duplicateIndex++;
+            eventIds.add(eventId);
+
+            if (!diagnosticExportText(event.frameId || '', 100)) orphanEventCount++;
+            const run = ensureRun(event);
+            if (event.event === 'window-error') {
+                const group = ensureException(run, event);
+                group.children.push(diagnosticExportEventRecord(event, eventId, group.id, links, mode, {
+                    message: '',
+                }));
+                continue;
+            }
+
+            let operation = links.operationId ? ensureOperation(run, links, event) : null;
+            let parent = operation || run;
+            const request = links.exchangeId ? ensureRequest(run, operation, links, event) : null;
+            if (request) parent = request;
+            else if (!operation && links.actionId) parent = ensureInteraction(run, links, event) || parent;
+            else if (!operation && (event.category === 'courseware' || event.event === 'slide-data-captured')) {
+                parent = ensureCategoryNode(run, 'courseware', 'coursewareCapture', event,
+                    { collection: true, ...(links.lessonId ? { lessonId: links.lessonId } : {}) });
+            } else if (!operation && event.category === 'diagnostics') {
+                parent = ensureCategoryNode(run, 'diagnostics', 'diagnosticExport', event, {});
+            }
+            parent.children.push(diagnosticExportEventRecord(event, eventId, parent.id, links, mode,
+                { data: event.details }));
+        }
+
+        const diagnostics = {
+            storedEventCount: allEvents.length,
+            exportedEventCount: ordered.length,
+            filteredEventCount: allEvents.length - ordered.length,
+            briefVisibleEventCount: allEvents.filter(event => event.userVisible).length,
+            hotBufferEventCount: diagnosticEvents.length,
+            hotBufferDroppedEventCount: diagnosticDropped,
+            persistentEventCount: Number(options.persistentEventCount) || 0,
+            persistentStorageBytes: Number(options.storageBytes) || 0,
+            bufferedBytes: diagnosticBytes,
+            bufferLimited: diagnosticDropped > 0 || Number(options.evictedEventCount) > 0,
+            evictedEventCount: Number(options.evictedEventCount) || 0,
+            evictions: Array.isArray(options.evictions) ? options.evictions : [],
+            persistentStorage: diagnosticDbAvailable === true,
+            captureContinuesAcrossReloads: diagnosticDbAvailable === true,
+            fullAiPayloadIncluded: mode === 'detail',
+            secretsRedacted: true,
+            orphanEventCount,
+        };
+        return {
+            header: {
+                type: 'header',
+                schemaVersion: DIAGNOSTIC_SCHEMA_VERSION,
+                schema: 'rain-classroom-plugin-diagnostics.jsonl',
+                packageType: 'rain-classroom-plugin-diagnostics',
+                mode,
+                generatedAt: now.toISOString(),
+                sessionId,
+            },
+            sessionNode,
             summary: {
-                eventCount: events.length,
+                eventCount: ordered.length,
                 byCategory,
                 byLevel,
                 lastError: lastError ? {
@@ -2914,44 +3215,104 @@
                     event: lastError.event, message: lastError.message || '',
                 } : null,
             },
-            diagnostics: {
-                storedEventCount: allEvents.length,
-                exportedEventCount: events.length,
-                briefVisibleEventCount: allEvents.filter(event => event.userVisible).length,
-                hotBufferEventCount: diagnosticEvents.length,
-                hotBufferDroppedEventCount: diagnosticDropped,
-                persistentEventCount: Number(options.persistentEventCount) || 0,
-                persistentStorageBytes: Number(options.storageBytes) || 0,
-                bufferedBytes: diagnosticBytes,
-                bufferLimited: diagnosticDropped > 0 || Number(options.evictedEventCount) > 0,
-                evictedEventCount: Number(options.evictedEventCount) || 0,
-                evictions: Array.isArray(options.evictions) ? options.evictions : [],
-                persistentStorage: diagnosticDbAvailable === true,
-                captureContinuesAcrossReloads: diagnosticDbAvailable === true,
-                fullAiPayloadIncluded: mode === 'detail',
-                secretsRedacted: true,
-            },
-            events,
+            diagnostics,
         };
     }
 
     function diagnosticFilename(mode, now = new Date()) {
         const pad = value => String(value).padStart(2, '0');
         const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-        return `rainclassroom-log-${stamp}-${mode === 'detail' ? 'detail' : 'brief'}.json`;
+        return `rainclassroom-log-${stamp}-${mode === 'detail' ? 'detail' : 'brief'}.jsonl`;
     }
 
-    function diagnosticPackageBlob(diagnosticPackage) {
-        const metadata = { ...diagnosticPackage };
-        delete metadata.events;
-        const head = JSON.stringify(metadata, null, 2);
-        const parts = [head.slice(0, -2), ',\n  "events": ['];
-        diagnosticPackage.events.forEach((event, index) => {
-            if (index) parts.push(',');
-            parts.push(JSON.stringify(event));
-        });
-        parts.push('\n  ]\n}');
-        return new Blob(parts, { type: 'application/json;charset=utf-8' });
+    async function diagnosticExportPayload(value, context) {
+        const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+        const kind = typeof value === 'string' ? 'text:' : 'json:';
+        const digest = await diagnosticDigest(kind + serialized);
+        const key = digest ? kind + digest : '';
+        if (key && context.payloadByValue.has(key)) return context.payloadByValue.get(key);
+        const fallback = shortFingerprint(serialized) + '-' + context.payloads.length;
+        const id = 'payload:sha256:' + (digest || fallback);
+        const dataUrl = typeof value === 'string' ? /^data:([^;,]+)[;,]/.exec(value) : null;
+        const record = {
+            type: 'payload',
+            id,
+            parentId: context.sessionId,
+            encoding: typeof value === 'string' ? 'utf8' : 'json',
+            mimeType: dataUrl ? dataUrl[1].slice(0, 200) : (typeof value === 'string' ? 'text/plain' : 'application/json'),
+            bytes: diagnosticByteLength(value),
+            data: value,
+        };
+        context.payloads.push(record);
+        if (key) context.payloadByValue.set(key, record);
+        return record;
+    }
+
+    async function prepareDiagnosticExportRecord(record, context) {
+        const output = { ...record };
+        delete output.children;
+        if (output.data !== undefined && diagnosticByteLength(output.data) > CONFIG.DIAGNOSTIC_EXPORT_INLINE_BYTES) {
+            const payload = await diagnosticExportPayload(output.data, context);
+            output.data = { $payloadRef: payload.id };
+            output.payloadRefs = [payload.id];
+        }
+        if (output.message !== undefined && diagnosticByteLength(output.message) > CONFIG.DIAGNOSTIC_EXPORT_INLINE_BYTES) {
+            const payload = await diagnosticExportPayload(output.message, context);
+            output.message = '[payload]';
+            output.messageRef = payload.id;
+            output.payloadRefs = [...new Set([...(output.payloadRefs || []), payload.id])];
+        }
+        return output;
+    }
+
+    async function diagnosticPackageBlob(diagnosticPackage) {
+        const context = {
+            sessionId: diagnosticPackage.sessionNode.id,
+            payloads: [], payloadByValue: new Map(),
+        };
+        const records = [diagnosticPackage.header];
+        const counters = { nodes: 0, events: 0 };
+        const emitNode = async node => {
+            const record = await prepareDiagnosticExportRecord(node, context);
+            records.push(record);
+            if (record.type === 'node') counters.nodes++;
+            if (record.type === 'event') counters.events++;
+            for (const child of node.children || []) await emitNode(child);
+        };
+        await emitNode(diagnosticPackage.sessionNode);
+        for (const payload of context.payloads) records.push(payload);
+
+        const ids = records.map(record => record.id).filter(Boolean);
+        const uniqueIds = new Set(ids);
+        const missingParents = records.filter(record => record.parentId && !uniqueIds.has(record.parentId)).length;
+        const payloadIds = new Set(context.payloads.map(payload => payload.id));
+        const referencedPayloadIds = new Set(records.flatMap(record => record.payloadRefs || []));
+        const missingPayloads = [...referencedPayloadIds].filter(id => !payloadIds.has(id)).length;
+        const summary = {
+            type: 'summary',
+            id: 'summary:' + context.sessionId.slice('session:'.length),
+            parentId: context.sessionId,
+            eventCount: counters.events,
+            byCategory: diagnosticPackage.summary.byCategory,
+            byLevel: diagnosticPackage.summary.byLevel,
+            lastError: diagnosticPackage.summary.lastError,
+            counts: {
+                records: records.length + 1,
+                nodes: counters.nodes,
+                events: counters.events,
+                payloads: context.payloads.length,
+            },
+            diagnostics: diagnosticPackage.diagnostics,
+            integrity: {
+                duplicateIds: ids.length - uniqueIds.size,
+                missingParents,
+                missingPayloads,
+                orphanEventCount: diagnosticPackage.diagnostics.orphanEventCount,
+            },
+        };
+        records.push(summary);
+        const lines = records.map(record => JSON.stringify(record));
+        return new Blob(lines.map(line => line + '\n'), { type: 'application/x-ndjson;charset=utf-8' });
     }
 
     async function exportDiagnosticLog(mode = 'brief', options = {}) {
@@ -2977,7 +3338,7 @@
                 evictedEventCount: session.evictedEventCount, evictions: session.evictions,
             });
             const filename = diagnosticFilename(mode, now);
-            const blob = diagnosticPackageBlob(diagnosticPackage);
+            const blob = await diagnosticPackageBlob(diagnosticPackage);
             const url = URL.createObjectURL(blob);
             const anchor = document.createElement('a');
             anchor.href = url;
@@ -3666,11 +4027,12 @@
         document.getElementById('rc-panel-container').addEventListener('click', event => {
             const button = event.target.closest?.('button');
             if (!button) return;
+            const actionId = createItemId();
             recordDiagnosticEvent('interaction', 'button-click', '', {
                 id: String(button.id || '').slice(0, 100),
                 label: String(button.textContent || '').trim().slice(0, 200),
                 disabled: button.disabled === true,
-            });
+            }, { actionId });
         });
         setupQuizForm();
 
@@ -4171,9 +4533,10 @@
         else forwardCapture({ kind: 'quiz', frameId, event });
     }
 
-    function captureQuestionSlides(json) {
+    function captureQuestionSlides(json, options = {}) {
         const slides = json?.data?.slides;
         if (!Array.isArray(slides)) return;
+        const operationId = options.operationId || 'courseware:' + createItemId();
         let captured = 0;
         const changedQuestionIds = new Set();
         for (const slide of slides) {
@@ -4198,7 +4561,8 @@
         }
         while (localSlides.size > 500) localSlides.delete(localSlides.keys().next().value);
         if (changedQuestionIds.size && IS_TOP_WINDOW) recordDiagnosticEvent('quiz', 'slide-data-captured', '',
-            { capturedCount: captured, changedCount: changedQuestionIds.size, storedSlideCount: localSlides.size });
+            { capturedCount: captured, changedCount: changedQuestionIds.size, storedSlideCount: localSlides.size },
+            { operationId });
         for (const q of localQuestions.values()) {
             if (changedQuestionIds.has(q.id)) publishLocalQuestion(q);
         }
@@ -4478,7 +4842,7 @@
                 anonymous: options.anonymous === true, headers: options.headers || {},
                 body: requestBody,
                 bodyBytes: typeof options.data === 'string' ? new TextEncoder().encode(options.data).byteLength : null,
-            });
+            }, { operationId: job?.operationId });
             let request;
             const finish = (fn, value) => { job.requests.delete(cancel); fn(value); };
             const cancel = () => { finish(reject, new Error('已取消')); request?.abort?.(); };
@@ -4500,7 +4864,8 @@
                                 : Number(response.response?.size) || null,
                             responseText: options.responseType === 'blob' ? undefined : response.responseText,
                             responseBlob: response.response instanceof Blob ? response.response : undefined,
-                        }, { level: response.status >= 200 && response.status < 300 ? 'debug' : 'warn' });
+                        }, { level: response.status >= 200 && response.status < 300 ? 'debug' : 'warn',
+                            operationId: job?.operationId });
                         if (response.status < 200 || response.status >= 300) {
                             const error = new Error('HTTP ' + response.status);
                             error.status = response.status;
@@ -4522,21 +4887,25 @@
                         else finish(resolve, response);
                     },
                     onerror: () => {
-                        diagnosticErrorEvent('ai', 'request-error', new Error('网络请求失败'), 'AI 网络请求失败');
+                        diagnosticErrorEvent('ai', 'request-error', new Error('网络请求失败'), 'AI 网络请求失败',
+                            { operationId: job?.operationId });
                         finish(reject, new Error('网络请求失败'));
                     },
                     ontimeout: () => {
-                        diagnosticErrorEvent('ai', 'request-timeout', new Error('请求超时'), 'AI 请求超时');
+                        diagnosticErrorEvent('ai', 'request-timeout', new Error('请求超时'), 'AI 请求超时',
+                            { operationId: job?.operationId });
                         finish(reject, new Error('请求超时'));
                     },
                     onabort: () => {
                         recordDiagnosticEvent('ai', 'request-aborted', 'AI 请求已取消',
-                            { exchangeId, kind: diagnosticName, elapsedMs: Math.max(0, Date.now() - requestStartedAt) }, { level: 'warn' });
+                            { exchangeId, kind: diagnosticName, elapsedMs: Math.max(0, Date.now() - requestStartedAt) },
+                            { level: 'warn', operationId: job?.operationId });
                         finish(reject, new Error('请求已取消'));
                     },
                 });
             } catch (err) {
-                diagnosticErrorEvent('ai', 'request-start-failed', err, 'AI 请求无法启动');
+                diagnosticErrorEvent('ai', 'request-start-failed', err, 'AI 请求无法启动',
+                    { operationId: job?.operationId });
                 finish(reject, new Error('请求无法启动'));
             }
         });
@@ -4591,7 +4960,7 @@
             ...QUIZ_DEFAULTS, ...(input || {}), mode: requestedMode === 'random' ? 'ai-display' : requestedMode,
             enabled: true,
         });
-        const job = { cancelled: false, requests: new Set() };
+        const job = { cancelled: false, requests: new Set(), operationId: 'connection-test:' + createItemId() };
         aiConnectionTest = job;
         try {
             const response = await quizRequest({ method: 'POST', url: aiEndpoint(settings.baseURL),
@@ -4659,6 +5028,10 @@
         };
     }
 
+    function quizDiagnosticOptions(q, options = {}) {
+        return { ...options, operationId: q?.operationId || options.operationId };
+    }
+
     function receiveQuizEvent(event, sourceFrame) {
         if (!IS_TOP_WINDOW || event?.type !== 'question' || !validQuizId(sourceFrame)) return;
         const source = event.question;
@@ -4685,9 +5058,11 @@
         if (q) {
             Object.assign(q, incoming, { sourceFrame, answered: q.answered || incoming.answered });
         } else {
-            q = { ...incoming, sourceFrame, key, status: '等待处理', attempted: false };
+            q = { ...incoming, sourceFrame, key, status: '等待处理', attempted: false,
+                operationId: 'quiz:' + createItemId() };
             quizQuestions.set(key, q);
         }
+        if (!q.operationId) q.operationId = 'quiz:' + createItemId();
         if (!quizEligible(q)) {
             stopQuizJob(q);
             if (q.answered) {
@@ -4710,7 +5085,8 @@
         if (!previousState || previousState !== currentState) {
             recordDiagnosticEvent('quiz', q.attempted || q.answered ? 'question-updated' : 'question-received',
                 '答题：' + (q.status || '已收到题目'), quizDiagnosticDetails(q),
-                { level: /失败|不支持|已结束/.test(q.status) ? 'warn' : 'info', userVisible: true });
+                quizDiagnosticOptions(q,
+                    { level: /失败|不支持|已结束/.test(q.status) ? 'warn' : 'info', userVisible: true }));
         }
         renderQuizStatus();
     }
@@ -4720,9 +5096,10 @@
         const job = { cancelled: false, settings: { ...quizSettings }, requests: new Set(), started: Date.now(),
             timer: null, retryTimer: null, formatFailures: 0 };
         q.job = job;
+        if (!q.operationId) q.operationId = 'quiz:' + createItemId();
         q.status = job.settings.mode === 'random' ? '等待随机提交' : '正在请求 AI…';
         recordDiagnosticEvent('quiz', 'processing-started', '答题：' + q.status,
-            quizDiagnosticDetails(q), { level: 'info', userVisible: true });
+            quizDiagnosticDetails(q), quizDiagnosticOptions(q, { level: 'info', userVisible: true }));
         scheduleQuizJob(q);
         if (job.settings.mode === 'random') return;
         const attempt = () => {
@@ -4738,7 +5115,7 @@
                         formatFailures: job.formatFailures,
                         choices: answer.choices.slice(0, 100),
                         explanation: String(answer.explanation || '').slice(0, 16000),
-                    }), { level: 'success', userVisible: true });
+                    }), quizDiagnosticOptions(q, { level: 'success', userVisible: true }));
                 if (job.settings.mode === 'ai-display') {
                     q.done = true;
                     q.status = 'AI 建议（请在网页中手动提交）';
@@ -4753,7 +5130,7 @@
                     q.status = 'AI 返回格式无效，正在重试（第 ' + job.formatFailures + ' 次）…';
                     recordDiagnosticEvent('quiz', 'ai-format-retry', '答题：' + q.status,
                         quizDiagnosticDetails(q, { error: sanitizeDiagnosticError(err), formatFailures: job.formatFailures }),
-                        { level: 'warn', userVisible: true });
+                        quizDiagnosticOptions(q, { level: 'warn', userVisible: true }));
                     renderQuizStatus();
                     job.retryTimer = setTimeout(attempt, CONFIG.AI_RETRY_DELAY_MS);
                     return;
@@ -4763,7 +5140,7 @@
                     q.status = 'AI 请求失败：' + err.message;
                     recordDiagnosticEvent('quiz', 'ai-request-failed', '答题：' + q.status,
                         quizDiagnosticDetails(q, { error: sanitizeDiagnosticError(err) }),
-                        { level: 'error', userVisible: true });
+                        quizDiagnosticOptions(q, { level: 'error', userVisible: true }));
                     q.done = true;
                     stopQuizJob(q);
                     renderQuizStatus();
@@ -4786,7 +5163,7 @@
                 q.status = job.formatFailures ? 'AI 多次返回格式无效，超时未提交' : 'AI 超时，未提交';
                 recordDiagnosticEvent('quiz', 'ai-timeout', '答题：' + q.status,
                     quizDiagnosticDetails(q, { formatFailures: job.formatFailures }),
-                    { level: 'warn', userVisible: true });
+                    quizDiagnosticOptions(q, { level: 'warn', userVisible: true }));
                 q.done = true; stopQuizJob(q); renderQuizStatus();
             } else if (!quizEligible(q)) {
                 q.status = '题目已结束或已作答，未提交'; stopQuizJob(q); renderQuizStatus();
@@ -4796,7 +5173,7 @@
                     : job.formatFailures ? 'AI 多次返回格式无效，随机兜底' : '超时或临近截止，随机兜底';
                 recordDiagnosticEvent('quiz', 'fallback-selected', '答题：' + reason,
                     quizDiagnosticDetails(q, { choices: fallback.slice(0, 100), formatFailures: job.formatFailures }),
-                    { level: 'warn', userVisible: true });
+                    quizDiagnosticOptions(q, { level: 'warn', userVisible: true }));
                 submitQuizAnswer(q, fallback, reason);
             }
         }, Math.max(0, when - Date.now()));
@@ -4830,7 +5207,7 @@
         q.status = '准备提交：' + choices.join('、') + '（' + reason + '）';
         recordDiagnosticEvent('quiz', 'submission-prepared', '答题：' + q.status,
             quizDiagnosticDetails(q, { choices: choices.slice(0, 100), reason }),
-            { level: 'info', userVisible: true });
+            quizDiagnosticOptions(q, { level: 'info', userVisible: true }));
         renderQuizStatus();
         try {
             if (!await claimQuizAttempt(q)) { q.status = '已在其他页面处理，跳过重复提交'; return; }
@@ -4841,13 +5218,13 @@
             q.status = '提交成功：' + choices.join('、') + '（' + reason + '）';
             recordDiagnosticEvent('quiz', 'submission-confirmed', '答题：' + q.status,
                 quizDiagnosticDetails(q, { choices: choices.slice(0, 100), reason, resultCode: result?.code }),
-                { level: 'success', userVisible: true });
+                quizDiagnosticOptions(q, { level: 'success', userVisible: true }));
             if (result.code !== 0) throw new Error('提交未获确认');
         } catch (err) {
             q.status = '未确认保存：' + err.message + '；请检查网页，本题不会自动重试';
             recordDiagnosticEvent('quiz', 'submission-failed', '答题：' + q.status,
                 quizDiagnosticDetails(q, { choices: choices.slice(0, 100), reason, error: sanitizeDiagnosticError(err) }),
-                { level: 'error', userVisible: true });
+                quizDiagnosticOptions(q, { level: 'error', userVisible: true }));
         } finally { renderQuizStatus(); }
     }
 
@@ -4855,6 +5232,7 @@
         const authorization = {
             id: createItemId(), frameId: q.sourceFrame, enabled: quizSettings.enabled === true,
             mode: quizSettings.mode, issuedAt: Date.now(), expiresAt: Date.now() + 10000,
+            operationId: q.operationId || '',
         };
         if (q.sourceFrame === frameId) {
             return new Promise((resolve, reject) => {
@@ -4895,10 +5273,11 @@
             publishLocalQuestion(q);
             recordDiagnosticEvent('quiz', 'source-submit-complete', '', {
                 questionId: String(q.id || '').slice(0, 100), resultCode: result?.code,
-            }, { level: 'info' });
+            }, { level: 'info', operationId: authorization.operationId });
             return { code: 0 };
         } catch (err) {
-            diagnosticErrorEvent('quiz', 'source-submit-failed', err, '源页面答题提交失败');
+            diagnosticErrorEvent('quiz', 'source-submit-failed', err, '源页面答题提交失败',
+                { operationId: authorization.operationId });
             throw new Error('服务器拒绝或网络异常');
         }
         finally { ownSubmissions.delete(q.id); }
